@@ -897,3 +897,59 @@ async def stop(update, context):
 # =========================================================
 # ADD PLAYER
 # ===================
+app = FastAPI(
+    title="eFootball Auction Bot",
+    lifespan=lifespan
+)
+
+
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "eFootball Auction Bot"
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy"
+    }
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+
+    received_secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+    )
+
+    if received_secret != WEBHOOK_SECRET:
+        raise HTTPException(
+            status_code=403,
+            detail="forbidden"
+        )
+
+    try:
+        data = await request.json()
+
+        update = Update.de_json(
+            data,
+            BOT.bot
+        )
+
+        await BOT.process_update(update)
+
+        return {"ok": True}
+
+    except Exception as error:
+        log.exception(
+            "Webhook processing error: %s",
+            error
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Webhook processing failed"
+        )
