@@ -1,23 +1,49 @@
 import os
 import logging
 import secrets
-import string
-import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    ContextTypes,
     ConversationHandler,
+    ContextTypes,
     filters,
 )
 
 import db
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is required.")
+
+if not PUBLIC_URL:
+    raise RuntimeError(
+        "PUBLIC_URL or RENDER_EXTERNAL_URL environment variable is required."
+    )
+
+PUBLIC_URL = PUBLIC_URL.rstrip("/")
+WEBHOOK_PATH = "/telegram/webhook"
+
+STARTING_BALANCE = 100.0
 
 
 # =========================================================
@@ -26,117 +52,31 @@ import db
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-log = logging.getLogger("auction_bot")
+log = logging.getLogger("efootball-auction-bot")
 
 
 # =========================================================
-# ENVIRONMENT
+# CREATE AUCTION STATES
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN")
-
-PUBLIC_URL = (
-    os.getenv("PUBLIC_URL")
-    or os.getenv("RENDER_EXTERNAL_URL")
-)
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
-
-INITIAL_BALANCE = float(
-    os.getenv("INITIAL_BALANCE", "100")
-)
-
-BID_SECONDS = int(
-    os.getenv("BID_SECONDS", "30")
-)
-
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-}
-
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-
-if not PUBLIC_URL:
-    raise RuntimeError(
-        "PUBLIC_URL or RENDER_EXTERNAL_URL is required"
-    )
-
-
-# =========================================================
-# TELEGRAM APPLICATION
-# =========================================================
-
-BOT = Application.builder().token(TOKEN).build()
-
-
-# =========================================================
-# CONVERSATION STATES
-# =========================================================
-
-CREATE_NAME, CREATE_LIMIT, CREATE_PLAYERS = range(3)
-
-
-# =========================================================
-# AUCTION TASKS
-# =========================================================
-
-auction_tasks = {}
+CREATE_NAME = 1
+CREATE_PARTICIPANTS = 2
+CREATE_PLAYERS = 3
 
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-def generate_code():
-    """Generate a unique 6-digit auction code."""
-    return "".join(
-        secrets.choice(string.digits)
-        for _ in range(6)
-    )
+def auction_code():
+    return secrets.token_hex(3).upper()
 
 
-def kb(rows):
-    return InlineKeyboardMarkup(rows)
-
-
-def is_admin(uid):
-    return uid in ADMIN_IDS
-
-
-def can_control(auction, uid):
-    return (
-        auction
-        and (
-            auction["host_id"] == uid
-            or is_admin(uid)
-        )
-    )
-
-
-def auction_text(auction):
-    stats = db.stats(auction["id"])
-
-    return (
-        f"🎯 *{auction['name']}*\n"
-        f"🆔 `{auction['code']}`\n"
-        f"👥 Participants: "
-        f"{stats['participants']}/{auction['max_participants']}\n"
-        f"👤 Players: {stats['players']}/500\n"
-        f"💰 Base price: 2.0 Cr\n"
-        f"📈 Increment: 0.5 Cr\n"
-        f"📌 State: *{auction['state']}*"
-    )
-
-
-def dashboard():
-    return kb([
+def dashboard_keyboard():
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "🏆 Create Auction",
@@ -144,27 +84,27 @@ def dashboard():
             ),
             InlineKeyboardButton(
                 "🎯 Join Auction",
-                callback_data="join"
+                callback_data="join_help"
             ),
         ],
         [
             InlineKeyboardButton(
-                "🔥 Live Auctions",
+                "🔴 Live Auctions",
                 callback_data="live"
             ),
             InlineKeyboardButton(
-                "👤 My Team",
-                callback_data="team"
+                "💰 My Balance",
+                callback_data="balance_help"
             ),
         ],
         [
             InlineKeyboardButton(
-                "💰 My Balance",
-                callback_data="balance"
+                "👥 My Team",
+                callback_data="team_help"
             ),
             InlineKeyboardButton(
-                "📊 Auction History",
-                callback_data="history"
+                "📜 Auction History",
+                callback_data="history_help"
             ),
         ],
         [
@@ -176,48 +116,135 @@ def dashboard():
     ])
 
 
+def auction_keyboard(auction):
+    code = auction["code"]
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💰 Bid +0.5 Cr",
+                callback_data=f"bid:0.5:{code}"
+            ),
+            InlineKeyboardButton(
+                "💰 Bid +1.0 Cr",
+                callback_data=f"bid:1.0:{code}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 Bid +1.5 Cr",
+                callback_data=f"bid:1.5:{code}"
+            ),
+            InlineKeyboardButton(
+                "💰 Bid +2.0 Cr",
+                callback_data=f"bid:2.0:{code}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Current Bid",
+                callback_data=f"bids:{code}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 My Balance",
+                callback_data=f"bal:{code}"
+            ),
+            InlineKeyboardButton(
+                "👥 My Team",
+                callback_data=f"team:{code}"
+            ),
+        ],
+    ])
+
+
+def host_keyboard(auction):
+    code = auction["code"]
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "▶️ Start",
+                callback_data=f"start:{code}"
+            ),
+            InlineKeyboardButton(
+                "⏸ Pause",
+                callback_data=f"pause:{code}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "▶️ Resume",
+                callback_data=f"resume:{code}"
+            ),
+            InlineKeyboardButton(
+                "🔨 Sell / Next",
+                callback_data=f"sell:{code}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Stats",
+                callback_data=f"stats:{code}"
+            ),
+        ],
+    ])
+
+
 # =========================================================
 # START
 # =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    db.upsert_user(update.effective_user)
+    user = update.effective_user
 
-    await update.effective_message.reply_text(
+    db.upsert_user(user)
+
+    text = (
         "⚽ *eFootball Auction Bot*\n\n"
-        "Virtual credits only. Free to use.\n"
-        "Each auction: maximum 100 participants "
-        "and 500 players.\n"
-        "Starting balance: 100 Cr.\n\n"
-        "Choose an option:",
-        parse_mode="Markdown",
-        reply_markup=dashboard(),
+        "Virtual credits only. Free to use.\n\n"
+        "💰 Starting balance: 100 Cr\n"
+        "💵 First bid: 2 Cr\n"
+        "📈 Later bid increment: 0.5–2 Cr\n"
+        "👥 Max participants per auction: 100\n"
+        "⚽ Max players per auction: 500\n\n"
+        "Choose an option:"
     )
+
+    if update.message:
+        await update.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=dashboard_keyboard(),
+        )
 
 
 # =========================================================
 # HELP
 # =========================================================
 
-async def help_cmd(update, context):
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     text = (
         "❓ *HELP*\n\n"
-        "/createauction — create an auction\n"
-        "/join 123456 — join an auction\n"
-        "/live — view live auctions\n"
-        "/balance 123456 — view balance\n"
-        "/team 123456 — view your team\n"
-        "/auction 123456 — auction dashboard\n"
-        "/mybids 123456 — current bid history\n"
-        "/history — auction history\n"
-        "/admin — admin commands\n\n"
-        "💰 Base price: 2.0 Cr\n"
-        "📈 Minimum bid increment: 0.5 Cr"
+        "/start — Open dashboard\n"
+        "/createauction — Create an auction\n"
+        "/join CODE — Join an auction\n"
+        "/live — Live auctions\n"
+        "/balance CODE — Check balance\n"
+        "/team CODE — View your team\n"
+        "/auction CODE — Auction dashboard\n"
+        "/history — Auction history\n\n"
+        "💰 First bid is always 2.0 Cr.\n"
+        "📈 Later bids can increase by 0.5, 1.0, 1.5 or 2.0 Cr."
     )
 
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         text,
         parse_mode="Markdown"
     )
@@ -227,57 +254,49 @@ async def help_cmd(update, context):
 # CREATE AUCTION
 # =========================================================
 
-async def create_command(update, context):
-    """
-    Starts the create auction conversation from /createauction.
-    """
+async def create_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    db.upsert_user(update.effective_user)
-
-    await update.effective_message.reply_text(
-        "🏆 *Create Auction*\n\n"
-        "Enter the auction name:",
-        parse_mode="Markdown"
-    )
-
-    return CREATE_NAME
+    return await create_start(update, context)
 
 
-async def create_start(update, context):
-    """
-    Starts the same conversation when the
-    Create Auction inline button is pressed.
-    """
+async def create_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if update.callback_query:
         await update.callback_query.answer()
 
-    db.upsert_user(update.effective_user)
-
-    await update.effective_message.reply_text(
-        "🏆 *Create Auction*\n\n"
-        "Enter the auction name:",
-        parse_mode="Markdown"
-    )
+        await update.callback_query.message.reply_text(
+            "🏆 Enter the auction name:"
+        )
+    else:
+        await update.message.reply_text(
+            "🏆 Enter the auction name:"
+        )
 
     return CREATE_NAME
 
 
-async def create_name(update, context):
+async def create_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     name = update.message.text.strip()
 
     if not name:
         await update.message.reply_text(
-            "❌ Auction name cannot be empty.\n\n"
-            "Please enter the auction name:"
+            "❌ Please enter a valid auction name."
         )
         return CREATE_NAME
 
-    if len(name) > 80:
+    if len(name) > 100:
         await update.message.reply_text(
-            "❌ Auction name must be 80 characters or less.\n\n"
-            "Please enter another name:"
+            "❌ Auction name is too long. Maximum 100 characters."
         )
         return CREATE_NAME
 
@@ -285,126 +304,149 @@ async def create_name(update, context):
 
     await update.message.reply_text(
         "👥 Enter maximum participants.\n\n"
-        "Allowed: 1–100"
+        "Minimum: 1\n"
+        "Maximum: 100\n\n"
+        "Example: 20"
     )
 
-    return CREATE_LIMIT
+    return CREATE_PARTICIPANTS
 
 
-async def create_limit(update, context):
+async def create_participants(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     try:
-        number = int(update.message.text.strip())
+        maximum = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_text(
-            "❌ Please enter a whole number from 1 to 100."
+            "❌ Enter a number between 1 and 100."
         )
-        return CREATE_LIMIT
+        return CREATE_PARTICIPANTS
 
-    if not 1 <= number <= 100:
+    if maximum < 1 or maximum > 100:
         await update.message.reply_text(
-            "❌ Maximum participants is 100.\n\n"
-            "Enter a number from 1 to 100:"
+            "❌ Participants must be between 1 and 100."
         )
-        return CREATE_LIMIT
+        return CREATE_PARTICIPANTS
 
-    context.user_data["max_participants"] = number
+    context.user_data["max_participants"] = maximum
 
     await update.message.reply_text(
-        "📋 *Send the player list*\n\n"
-        "Send one player per line.\n"
+        "⚽ Send the player list.\n\n"
+        "One player per line.\n\n"
         "Maximum: 500 players.\n\n"
         "Example:\n"
-        "Lionel Messi\n"
-        "Cristiano Ronaldo\n"
-        "Kylian Mbappe",
-        parse_mode="Markdown"
+        "Messi\n"
+        "Ronaldo\n"
+        "Mbappe\n"
+        "Haaland"
     )
 
     return CREATE_PLAYERS
 
 
-async def create_players(update, context):
+async def create_players(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    names = [
+    lines = [
         x.strip()
         for x in update.message.text.splitlines()
         if x.strip()
     ]
 
-    if not names:
+    if not lines:
         await update.message.reply_text(
-            "❌ Please send at least 1 player."
+            "❌ Please send at least one player."
         )
         return CREATE_PLAYERS
 
-    if len(names) > 500:
+    if len(lines) > 500:
         await update.message.reply_text(
-            "❌ Maximum 500 players allowed."
+            "❌ Maximum 500 players are allowed."
         )
         return CREATE_PLAYERS
 
-    auction_name = context.user_data.get(
-        "auction_name"
-    )
+    # Remove duplicates while preserving order
+    players = list(dict.fromkeys(lines))
 
-    max_participants = context.user_data.get(
-        "max_participants"
-    )
+    name = context.user_data["auction_name"]
+    maximum = context.user_data["max_participants"]
 
-    if not auction_name or not max_participants:
-        context.user_data.clear()
+    user = update.effective_user
+
+    db.upsert_user(user)
+
+    code = auction_code()
+
+    try:
+        auction_id = db.create_auction(
+            user.id,
+            name,
+            maximum,
+            code,
+        )
+
+        db.add_players(
+            auction_id,
+            players,
+        )
+
+        # Host automatically joins
+        ok, message = db.join_auction(
+            auction_id,
+            user.id,
+            STARTING_BALANCE,
+        )
+
+        if not ok:
+            await update.message.reply_text(
+                "❌ Could not add host to auction."
+            )
+            return ConversationHandler.END
+
+    except Exception as error:
+
+        log.exception(
+            "Create auction failed: %s",
+            error
+        )
 
         await update.message.reply_text(
-            "❌ Create session expired.\n"
-            "Please use /createauction again."
+            "❌ Auction creation failed. Please try again."
         )
 
         return ConversationHandler.END
 
-    # Generate unique code
-    auction_code = generate_code()
-
-    while db.get_auction(auction_code):
-        auction_code = generate_code()
-
-    # Create auction
-    auction_id = db.create_auction(
-        update.effective_user.id,
-        auction_name,
-        max_participants,
-        auction_code,
-    )
-
-    # Add players
-    db.add_players(
-        auction_id,
-        names
-    )
-
-    # Clear conversation data
-    context.user_data.clear()
-
-    auction = db.get_auction(auction_code)
-
     await update.message.reply_text(
-        "✅ *AUCTION CREATED!*\n\n"
-        f"{auction_text(auction)}\n\n"
-        "📢 Share this ID with participants:\n"
-        f"`/join {auction_code}`\n\n"
-        "When everyone has joined, start it using:\n"
-        f"`/startauction {auction_code}`",
-        parse_mode="Markdown"
+        "✅ *Auction Created!*\n\n"
+        f"🏆 Name: {name}\n"
+        f"🔑 Auction Code: `{code}`\n"
+        f"👥 Max Participants: {maximum}\n"
+        f"⚽ Players: {len(players)}\n"
+        f"💰 Starting Balance: {STARTING_BALANCE:.0f} Cr\n\n"
+        f"Share this code with participants:\n"
+        f"`/join {code}`\n\n"
+        "When everyone joins, use the auction dashboard to start.",
+        parse_mode="Markdown",
     )
+
+    context.user_data.clear()
 
     return ConversationHandler.END
 
 
-async def cancel_create(update, context):
+async def create_cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     context.user_data.clear()
 
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         "❌ Auction creation cancelled."
     )
 
@@ -412,125 +454,193 @@ async def cancel_create(update, context):
 
 
 # =========================================================
-# JOIN
+# JOIN AUCTION
 # =========================================================
 
-async def join(update, context):
+async def join_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not context.args:
-        await update.effective_message.reply_text(
-            "Use `/join 123456`",
-            parse_mode="Markdown"
+        await update.message.reply_text(
+            "Usage:\n/join AUCTION_CODE"
         )
         return
 
-    code_value = context.args[0]
+    code = context.args[0].strip().upper()
 
-    auction = db.get_auction(code_value)
+    auction = db.get_auction(code)
 
     if not auction:
-        await update.effective_message.reply_text(
+        await update.message.reply_text(
             "❌ Auction not found."
         )
         return
 
-    db.upsert_user(update.effective_user)
+    user = update.effective_user
+
+    db.upsert_user(user)
 
     ok, message = db.join_auction(
         auction["id"],
-        update.effective_user.id,
-        INITIAL_BALANCE
+        user.id,
+        STARTING_BALANCE,
     )
 
-    await update.effective_message.reply_text(
-        ("✅ " if ok else "❌ ")
-        + message
-        + "\n\n"
-        + auction_text(auction),
-        parse_mode="Markdown"
-    )
+    if ok:
+        await update.message.reply_text(
+            "✅ Joined auction!\n\n"
+            f"🏆 {auction['name']}\n"
+            f"💰 Balance: {STARTING_BALANCE:.1f} Cr\n\n"
+            f"Auction Code: `{auction['code']}`",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "❌ " + str(message)
+        )
 
 
 # =========================================================
 # LIVE AUCTIONS
 # =========================================================
 
-async def live(update, context):
+async def live_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     auctions = db.live_auctions()
 
     if not auctions:
-        await update.effective_message.reply_text(
-            "🔥 No live auctions currently."
+        await update.message.reply_text(
+            "🔴 No live auctions currently."
         )
         return
 
-    buttons = []
+    text = "🔴 *Live Auctions*\n\n"
 
     for auction in auctions:
+        count = db.participant_count(auction["id"])
 
-        buttons.append([
-            InlineKeyboardButton(
-                f"🎯 {auction['name']} #{auction['code']}",
-                callback_data=f"view:{auction['code']}"
-            )
-        ])
+        text += (
+            f"🏆 *{auction['name']}*\n"
+            f"🔑 `{auction['code']}`\n"
+            f"📌 State: {auction['state']}\n"
+            f"👥 Participants: {count}/{auction['max_participants']}\n\n"
+        )
 
-    await update.effective_message.reply_text(
-        "🔥 *LIVE AUCTIONS*",
+    await update.message.reply_text(
+        text,
         parse_mode="Markdown",
-        reply_markup=kb(buttons)
     )
 
 
 # =========================================================
-# AUCTION VIEW
+# AUCTION DASHBOARD
 # =========================================================
 
-async def auction_view(update, context):
+async def auction_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not context.args:
-        await update.effective_message.reply_text(
-            "Use `/auction 123456`",
-            parse_mode="Markdown"
+        await update.message.reply_text(
+            "Usage:\n/auction AUCTION_CODE"
         )
         return
 
-    auction = db.get_auction(
-        context.args[0]
-    )
+    code = context.args[0].strip().upper()
+
+    auction = db.get_auction(code)
 
     if not auction:
-        await update.effective_message.reply_text(
+        await update.message.reply_text(
             "❌ Auction not found."
         )
         return
 
-    await update.effective_message.reply_text(
-        auction_text(auction),
-        parse_mode="Markdown"
+    await send_auction_dashboard(
+        update,
+        auction,
     )
+
+
+async def send_auction_dashboard(
+    update_or_query,
+    auction,
+):
+
+    player = db.current_player(
+        auction["id"]
+    )
+
+    stats = db.stats(
+        auction["id"]
+    )
+
+    text = (
+        f"🏆 *{auction['name']}*\n\n"
+        f"🔑 Code: `{auction['code']}`\n"
+        f"📌 State: {auction['state']}\n"
+        f"👥 Participants: {stats['participants']}/{auction['max_participants']}\n"
+        f"⚽ Players: {stats['players']}\n"
+        f"✅ Sold: {stats['sold']}\n"
+        f"❌ Unsold: {stats['unsold']}\n"
+        f"⏳ Pending: {stats['pending']}\n\n"
+    )
+
+    if player:
+        text += (
+            "🔥 *CURRENT PLAYER*\n\n"
+            f"⚽ {player['name']}\n"
+            f"💰 Starting bid: 2.0 Cr\n\n"
+            "First bid is fixed at 2.0 Cr.\n"
+            "After that, use the +0.5 / +1 / +1.5 / +2 buttons."
+        )
+
+    else:
+        text += "⏳ No current player."
+
+    keyboard = auction_keyboard(auction)
+
+    if update_or_query.callback_query:
+        await update_or_query.callback_query.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+    else:
+        await update_or_query.message.reply_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
 
 
 # =========================================================
 # BALANCE
 # =========================================================
 
-async def balance(update, context):
+async def balance_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not context.args:
-        await update.effective_message.reply_text(
-            "Use `/balance 123456`",
-            parse_mode="Markdown"
+        await update.message.reply_text(
+            "Usage:\n/balance AUCTION_CODE"
         )
         return
 
-    auction = db.get_auction(
-        context.args[0]
-    )
+    code = context.args[0].strip().upper()
+
+    auction = db.get_auction(code)
 
     if not auction:
-        await update.effective_message.reply_text(
+        await update.message.reply_text(
             "❌ Auction not found."
         )
         return
@@ -541,14 +651,15 @@ async def balance(update, context):
     )
 
     if not participant:
-        await update.effective_message.reply_text(
+        await update.message.reply_text(
             "❌ You are not a participant."
         )
         return
 
-    await update.effective_message.reply_text(
-        f"💰 Balance: *{participant['balance']:.1f} Cr*",
-        parse_mode="Markdown"
+    await update.message.reply_text(
+        f"💰 *Your Balance*\n\n"
+        f"{participant['balance']:.1f} Cr",
+        parse_mode="Markdown",
     )
 
 
@@ -556,60 +667,56 @@ async def balance(update, context):
 # TEAM
 # =========================================================
 
-async def team(update, context):
+async def team_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if not context.args:
-        await update.effective_message.reply_text(
-            "Use `/team 123456`",
-            parse_mode="Markdown"
+        await update.message.reply_text(
+            "Usage:\n/team AUCTION_CODE"
         )
         return
 
-    auction = db.get_auction(
-        context.args[0]
-    )
+    code = context.args[0].strip().upper()
+
+    auction = db.get_auction(code)
 
     if not auction:
-        await update.effective_message.reply_text(
+        await update.message.reply_text(
             "❌ Auction not found."
         )
         return
 
-    participant = db.participant(
+    holdings = db.my_holdings(
         auction["id"],
         update.effective_user.id
     )
 
-    if not participant:
-        await update.effective_message.reply_text(
-            "❌ You are not a participant."
+    if not holdings:
+        await update.message.reply_text(
+            "👥 You haven't purchased any players yet."
         )
         return
 
-    rows = db.my_holdings(
-        auction["id"],
-        update.effective_user.id
-    )
+    text = "👥 *MY TEAM*\n\n"
 
-    text = "👤 *MY TEAM*\n\n"
+    total = 0
 
-    if rows:
-        text += "\n".join(
-            f"• {row['name']} — {row['price']:.1f} Cr"
-            for row in rows
+    for index, row in enumerate(holdings, start=1):
+        text += (
+            f"{index}. ⚽ {row['name']} — "
+            f"{row['price']:.1f} Cr\n"
         )
-    else:
-        text += "No players yet."
+        total += row["price"]
 
     text += (
-        f"\n\n"
-        f"Total players: {len(rows)}\n"
-        f"💰 Remaining: {participant['balance']:.1f} Cr"
+        f"\n💰 Total spent: {total:.1f} Cr"
     )
 
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         text,
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 
@@ -617,1130 +724,40 @@ async def team(update, context):
 # HISTORY
 # =========================================================
 
-async def history(update, context):
+async def history_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     rows = db.user_history(
         update.effective_user.id
     )
 
     if not rows:
-        await update.effective_message.reply_text(
-            "📊 No auction history yet."
+        await update.message.reply_text(
+            "📜 No auction history yet."
         )
         return
 
-    text = "📊 *AUCTION HISTORY*\n\n"
+    text = "📜 *AUCTION HISTORY*\n\n"
 
     for row in rows:
-
         text += (
-            f"• `{row['code']}` {row['name']} — "
-            f"{row['state']}\n"
-            f"  Won: {row['players_won']} | "
-            f"Spent: {row['spent']:.1f} Cr\n\n"
+            f"🏆 {row['name']}\n"
+            f"🔑 {row['code']}\n"
+            f"📌 {row['state']}\n"
+            f"⚽ Players won: {row['players_won']}\n"
+            f"💰 Spent: {row['spent']:.1f} Cr\n\n"
         )
 
-    await update.effective_message.reply_text(
+    await update.message.reply_text(
         text,
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 
 # =========================================================
-# MY BIDS
-# =========================================================
-
-async def mybids(update, context):
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Use `/mybids 123456`",
-            parse_mode="Markdown"
-        )
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-        return
-
-    participant = db.participant(
-        auction["id"],
-        update.effective_user.id
-    )
-
-    if not participant:
-        await update.effective_message.reply_text(
-            "❌ You are not a participant."
-        )
-        return
-
-    current_player = db.current_player(
-        auction["id"]
-    )
-
-    if not current_player:
-        await update.effective_message.reply_text(
-            "ℹ️ No active player."
-        )
-        return
-
-    rows = db.bid_history(
-        auction["id"],
-        current_player["id"]
-    )
-
-    text = (
-        "📊 *CURRENT BID HISTORY*\n\n"
-        f"🔨 {current_player['name']}\n\n"
-    )
-
-    if rows:
-        text += "\n".join(
-            f"{row['amount']:.1f} Cr — "
-            f"@{row['username'] or row['first_name']}"
-            for row in rows
-        )
-    else:
-        text += "No bids yet."
-
-    await update.effective_message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# =========================================================
-# START AUCTION
-# =========================================================
-
-async def startauction(update, context):
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Use `/startauction 123456`",
-            parse_mode="Markdown"
-        )
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-        return
-
-    if not can_control(
-        auction,
-        update.effective_user.id
-    ):
-        await update.effective_message.reply_text(
-            "❌ Only the host/admin can start this auction."
-        )
-        return
-
-    ok, message = db.start_auction(
-        auction["id"],
-        auction["host_id"]
-    )
-
-    if not ok:
-        await update.effective_message.reply_text(
-            "❌ " + message
-        )
-        return
-
-    await update.effective_message.reply_text(
-        "🚀 Auction started!"
-    )
-
-    await announce_current(
-        auction["id"],
-        context
-    )
-
-
-# =========================================================
-# PAUSE / RESUME
-# =========================================================
-
-async def pause(update, context):
-    await control_state(
-        update,
-        context,
-        "PAUSED"
-    )
-
-
-async def resume(update, context):
-    await control_state(
-        update,
-        context,
-        "RUNNING"
-    )
-
-
-async def control_state(
-    update,
-    context,
-    state
-):
-
-    command = (
-        "pauseauction"
-        if state == "PAUSED"
-        else "resumeauction"
-    )
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            f"Use `/{command} 123456`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-        return
-
-    if not can_control(
-        auction,
-        update.effective_user.id
-    ):
-        await update.effective_message.reply_text(
-            "❌ Not authorized."
-        )
-        return
-
-    db.set_state(
-        auction["id"],
-        state
-    )
-
-    if state == "PAUSED":
-        await update.effective_message.reply_text(
-            "⏸ Auction paused."
-        )
-    else:
-        await update.effective_message.reply_text(
-            "▶️ Auction resumed."
-        )
-
-
-# =========================================================
-# STOP
-# =========================================================
-
-async def stop(update, context):
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            "Use `/stopauction 123456`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-        return
-
-    if not can_control(
-        auction,
-        update.effective_user.id
-    ):
-        await update.effective_message.reply_text(
-            "❌ Not authorized."
-        )
-        return
-
-    db.set_state(
-        auction["id"],
-        "CANCELLED"
-    )
-
-    task = auction_tasks.get(
-        auction["id"]
-    )
-
-    if task and not task.done():
-        task.cancel()
-
-    await update.effective_message.reply_text(
-        "🛑 Auction cancelled."
-    )
-
-
-# =========================================================
-# ADD PLAYER
-# =========================================================
-
-async def addplayer(update, context):
-
-    if len(context.args) < 2:
-
-        await update.effective_message.reply_text(
-            "Use `/addplayer 123456 Player Name`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-        return
-
-    if not can_control(
-        auction,
-        update.effective_user.id
-    ):
-        await update.effective_message.reply_text(
-            "❌ Not authorized."
-        )
-        return
-
-    if auction["state"] not in (
-        "LOBBY",
-        "DRAFT"
-    ):
-        await update.effective_message.reply_text(
-            "❌ Players can only be added before the auction starts."
-        )
-        return
-
-    try:
-
-        db.add_player(
-            auction["id"],
-            " ".join(context.args[1:])
-        )
-
-        await update.effective_message.reply_text(
-            "✅ Player added."
-        )
-
-    except ValueError as error:
-
-        await update.effective_message.reply_text(
-            "❌ " + str(error)
-        )
-
-
-# =========================================================
-# REMOVE PLAYER
-# =========================================================
-
-async def removeplayer(update, context):
-
-    if len(context.args) < 2:
-
-        await update.effective_message.reply_text(
-            "Use `/removeplayer 123456 PLAYER_ID`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-        return
-
-    if not can_control(
-        auction,
-        update.effective_user.id
-    ):
-        await update.effective_message.reply_text(
-            "❌ Not authorized."
-        )
-        return
-
-    try:
-
-        player_id = int(
-            context.args[1]
-        )
-
-        ok = db.remove_player(
-            auction["id"],
-            player_id
-        )
-
-    except Exception:
-
-        ok = False
-
-    await update.effective_message.reply_text(
-        "✅ Removed."
-        if ok
-        else "❌ Player not found/pending."
-    )
-
-
-# =========================================================
-# RE-AUCTION
-# =========================================================
-
-async def reauction(update, context):
-
-    if len(context.args) < 2:
-
-        await update.effective_message.reply_text(
-            "Use `/reauction 123456 PLAYER_ID`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-        return
-
-    if not can_control(
-        auction,
-        update.effective_user.id
-    ):
-        await update.effective_message.reply_text(
-            "❌ Not authorized."
-        )
-        return
-
-    try:
-
-        player_id = int(
-            context.args[1]
-        )
-
-        ok, message = db.reauction_player(
-            auction["id"],
-            auction["host_id"],
-            player_id
-        )
-
-        await update.effective_message.reply_text(
-            ("✅ " if ok else "❌ ") + message
-        )
-
-    except Exception as error:
-
-        await update.effective_message.reply_text(
-            "❌ Invalid player ID."
-        )
-
-        log.exception(
-            "Reauction error: %s",
-            error
-        )
-
-
-# =========================================================
-# SKIP / UNSOLD
-# =========================================================
-
-async def skip(update, context):
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            "Use `/skip 123456`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-        return
-
-    if not can_control(
-        auction,
-        update.effective_user.id
-    ):
-        await update.effective_message.reply_text(
-            "❌ Not authorized."
-        )
-        return
-
-    result = db.mark_unsold_and_next(
-        auction["id"]
-    )
-
-    if not result:
-
-        await update.effective_message.reply_text(
-            "❌ No active player."
-        )
-
-        return
-
-    if result["next"]:
-
-        await announce_current(
-            auction["id"],
-            context
-        )
-
-    else:
-
-        await update.effective_message.reply_text(
-            "🏁 Auction completed."
-        )
-
-
-async def unsold(update, context):
-    await skip(update, context)
-
-
-# =========================================================
-# AUCTION STATS
-# =========================================================
-
-async def auctionstats(update, context):
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            "Use `/auctionstats 123456`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-
-        return
-
-    stats = db.stats(
-        auction["id"]
-    )
-
-    text = (
-        f"📊 *{auction['name']}*\n\n"
-        f"Players: {stats['players']}\n"
-        f"Sold: {stats['sold']}\n"
-        f"Unsold: {stats['unsold']}\n"
-        f"Remaining: {stats['pending']}\n"
-        f"Participants: {stats['participants']}"
-    )
-
-    await update.effective_message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# =========================================================
-# PARTICIPANTS
-# =========================================================
-
-async def participants(update, context):
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            "Use `/participants 123456`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-
-        return
-
-    if not can_control(
-        auction,
-        update.effective_user.id
-    ):
-
-        await update.effective_message.reply_text(
-            "❌ Not authorized."
-        )
-
-        return
-
-    with db.conn() as connection:
-
-        rows = connection.execute(
-            """
-            SELECT
-                u.username,
-                u.first_name,
-                p.balance
-            FROM participants p
-            JOIN users u
-                ON u.telegram_id = p.user_id
-            WHERE p.auction_id = ?
-            ORDER BY p.joined_at
-            """,
-            (auction["id"],)
-        ).fetchall()
-
-    text = "👥 *PARTICIPANTS*\n\n"
-
-    if rows:
-
-        text += "\n".join(
-            f"• @{row['username'] or row['first_name']} "
-            f"— {row['balance']:.1f} Cr"
-            for row in rows
-        )
-
-    else:
-
-        text += "None."
-
-    await update.effective_message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# =========================================================
-# RESULTS
-# =========================================================
-
-async def results(update, context):
-
-    if not context.args:
-
-        await update.effective_message.reply_text(
-            "Use `/results 123456`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    auction = db.get_auction(
-        context.args[0]
-    )
-
-    if not auction:
-
-        await update.effective_message.reply_text(
-            "❌ Auction not found."
-        )
-
-        return
-
-    rows = db.leaderboard(
-        auction["id"]
-    )
-
-    if not rows:
-
-        await update.effective_message.reply_text(
-            "🏆 No results yet."
-        )
-
-        return
-
-    medals = [
-        "🥇",
-        "🥈",
-        "🥉"
-    ]
-
-    text = "🏆 *AUCTION RESULTS*\n\n"
-
-    for index, row in enumerate(rows[:10]):
-
-        medal = (
-            medals[index]
-            if index < 3
-            else "▫️"
-        )
-
-        text += (
-            f"{medal} "
-            f"@{row['username'] or row['first_name']} — "
-            f"{row['players_won']} players, "
-            f"{row['spent']:.1f} Cr\n"
-        )
-
-    await update.effective_message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# =========================================================
-# ADMIN
-# =========================================================
-
-async def admin(update, context):
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-
-        await update.effective_message.reply_text(
-            "❌ Admin only."
-        )
-
-        return
-
-    text = (
-        "🛠 *ADMIN COMMANDS*\n\n"
-        "/createauction\n"
-        "/startauction CODE\n"
-        "/pauseauction CODE\n"
-        "/resumeauction CODE\n"
-        "/stopauction CODE\n"
-        "/addplayer CODE NAME\n"
-        "/removeplayer CODE PLAYER_ID\n"
-        "/reauction CODE PLAYER_ID\n"
-        "/skip CODE\n"
-        "/unsold CODE\n"
-        "/participants CODE\n"
-        "/auctionstats CODE\n"
-        "/results CODE\n"
-        "/broadcast TEXT"
-    )
-
-    await update.effective_message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# =========================================================
-# BROADCAST
-# =========================================================
-
-async def broadcast(update, context):
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-
-        await update.effective_message.reply_text(
-            "❌ Admin only."
-        )
-
-        return
-
-    text = " ".join(
-        context.args
-    ).strip()
-
-    if not text:
-
-        await update.effective_message.reply_text(
-            "Use `/broadcast message`",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    with db.conn() as connection:
-
-        ids = [
-            row["telegram_id"]
-            for row in connection.execute(
-                "SELECT telegram_id FROM users"
-            ).fetchall()
-        ]
-
-    sent = 0
-
-    for uid in ids:
-
-        try:
-
-            await context.bot.send_message(
-                uid,
-                text
-            )
-
-            sent += 1
-
-        except Exception:
-
-            pass
-
-    await update.effective_message.reply_text(
-        f"📣 Sent to {sent} users."
-    )
-
-
-# =========================================================
-# ANNOUNCE CURRENT PLAYER
-# =========================================================
-
-async def announce_current(
-    auction_id,
-    context
-):
-
-    auction = db.get_auction_by_id(
-        auction_id
-    )
-
-    if not auction:
-        return
-
-    player = db.current_player(
-        auction_id
-    )
-
-    if not player:
-
-        db.set_state(
-            auction_id,
-            "COMPLETED"
-        )
-
-        await context.bot.send_message(
-            auction["host_id"],
-            "🏁 Auction completed."
-        )
-
-        return
-
-    buttons = [
-    [
-        InlineKeyboardButton(
-            "💰 Bid +0.5 Cr",
-            callback_data=f"bid:0.5:{auction['code']}"
-        ),
-        InlineKeyboardButton(
-            "💰 Bid +1.0 Cr",
-            callback_data=f"bid:1.0:{auction['code']}"
-        )
-    ],
-    [
-        InlineKeyboardButton(
-            "💰 Bid +1.5 Cr",
-            callback_data=f"bid:1.5:{auction['code']}"
-        ),
-        InlineKeyboardButton(
-            "💰 Bid +2.0 Cr",
-            callback_data=f"bid:2.0:{auction['code']}"
-        )
-    ],
-    [
-        InlineKeyboardButton(
-            "📊 Current Bid",
-            callback_data=f"bids:{auction['code']}"
-        )
-    ],
-    [
-        InlineKeyboardButton(
-            "👤 My Balance",
-            callback_data=f"bal:{auction['code']}"
-        )
-    ],
-    [
-        InlineKeyboardButton(
-            "⏭️ Skip Player",
-            callback_data=f"skip:{auction['code']}"
-        )
-    ]
-    ]
-
-    text = (
-        "🔥 *PLAYER AUCTION STARTED*\n\n"
-        f"🔨 *{player['name']}*\n"
-        "💰 Current Bid: 2.0 Cr\n"
-        "👑 Highest Bidder: None\n"
-        f"⏱ Bidding time: {BID_SECONDS}s"
-    )
-
-    with db.conn() as connection:
-
-        ids = [
-            row["user_id"]
-            for row in connection.execute(
-                """
-                SELECT user_id
-                FROM participants
-                WHERE auction_id = ?
-                """,
-                (auction_id,)
-            ).fetchall()
-        ]
-
-    for uid in ids:
-
-        try:
-
-            await context.bot.send_message(
-                uid,
-                text,
-                parse_mode="Markdown",
-                reply_markup=kb(buttons)
-            )
-
-        except Exception as error:
-
-            log.warning(
-                "Could not notify user %s: %s",
-                uid,
-                error
-            )
-
-    old_task = auction_tasks.get(
-        auction_id
-    )
-
-    if old_task and not old_task.done():
-
-        old_task.cancel()
-
-    auction_tasks[auction_id] = asyncio.create_task(
-        player_timer(
-            auction_id,
-            context
-        )
-    )
-
-
-# =========================================================
-# PLAYER TIMER
-# =========================================================
-
-async def player_timer(
-    auction_id,
-    context
-):
-
-    try:
-
-        remaining = BID_SECONDS
-
-        while remaining > 0:
-
-            await asyncio.sleep(1)
-
-            auction = db.get_auction_by_id(
-                auction_id
-            )
-
-            if not auction:
-                return
-
-            if auction["state"] in (
-                "CANCELLED",
-                "COMPLETED"
-            ):
-                return
-
-            if auction["state"] == "PAUSED":
-                continue
-
-            remaining -= 1
-
-        auction = db.get_auction_by_id(
-            auction_id
-        )
-
-        if not auction:
-            return
-
-        if auction["state"] != "RUNNING":
-            return
-
-        result = db.sell_current(
-            auction_id
-        )
-
-        if not result:
-            return
-
-        player = result["sold_player"]
-        last_bid = result["last"]
-
-        with db.conn() as connection:
-
-            participant_ids = [
-                row["user_id"]
-                for row in connection.execute(
-                    """
-                    SELECT user_id
-                    FROM participants
-                    WHERE auction_id = ?
-                    """,
-                    (auction_id,)
-                ).fetchall()
-            ]
-
-        if last_bid:
-
-            with db.conn() as connection:
-
-                winner = connection.execute(
-                    """
-                    SELECT username, first_name
-                    FROM users
-                    WHERE telegram_id = ?
-                    """,
-                    (last_bid["user_id"],)
-                ).fetchone()
-
-            winner_name = (
-                winner["username"]
-                if winner and winner["username"]
-                else winner["first_name"]
-                if winner
-                else "Unknown"
-            )
-
-            message = (
-                "🔨 *SOLD!*\n\n"
-                f"👤 {player['name']}\n"
-                f"💰 Sold for: "
-                f"{last_bid['amount']:.1f} Cr\n"
-                f"👑 Winner: @{winner_name}"
-            )
-
-        else:
-
-            message = (
-                "⚪ *UNSOLD*\n\n"
-                f"👤 {player['name']}\n"
-                "No valid bids."
-            )
-
-        for uid in participant_ids:
-
-            try:
-
-                await context.bot.send_message(
-                    uid,
-                    message,
-                    parse_mode="Markdown"
-                )
-
-            except Exception:
-                pass
-
-        if result["next"]:
-
-            await asyncio.sleep(2)
-
-            await announce_current(
-                auction_id,
-                context
-            )
-
-        else:
-
-            db.set_state(
-                auction_id,
-                "COMPLETED"
-            )
-
-            rows = db.leaderboard(
-                auction_id
-            )
-
-            result_text = (
-                "🏁 *AUCTION COMPLETED*\n\n"
-                "🏆 *RESULTS*\n"
-            )
-
-            for index, row in enumerate(
-                rows[:10],
-                start=1
-            ):
-
-                result_text += (
-                    f"{index}. "
-                    f"@{row['username'] or row['first_name']} — "
-                    f"{row['players_won']} players — "
-                    f"{row['spent']:.1f} Cr\n"
-                )
-
-            for uid in participant_ids:
-
-                try:
-
-                    await context.bot.send_message(
-                        uid,
-                        result_text,
-                        parse_mode="Markdown"
-                    )
-
-                except Exception:
-                    pass
-
-    except asyncio.CancelledError:
-
-        return
-
-    except Exception:
-
-        log.exception(
-            "Player timer error for auction %s",
-            auction_id
-        )
-
-
-# =========================================================
-# CALLBACK BUTTON HANDLER
+# CALLBACK BUTTONS
 # =========================================================
 
 async def button(
@@ -1755,7 +772,7 @@ async def button(
     data = query.data or ""
 
     # -----------------------------------------------------
-    # DASHBOARD BUTTONS
+    # DASHBOARD
     # -----------------------------------------------------
 
     if data == "create":
@@ -1765,70 +782,66 @@ async def button(
             context
         )
 
-    if data == "join":
+    if data == "join_help":
 
         await query.message.reply_text(
-            "🎯 To join an auction, use:\n\n"
-            "`/join 123456`",
-            parse_mode="Markdown"
+            "Use:\n\n/join AUCTION_CODE\n\n"
+            "Example:\n/join ABC123"
         )
 
         return
 
     if data == "live":
 
-        await show_live_callback(
-            query
-        )
+        auctions = db.live_auctions()
 
-        return
-
-    if data == "team":
-
-        await query.message.reply_text(
-            "👤 Use `/team 123456` to view your team.",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    if data == "balance":
-
-        await query.message.reply_text(
-            "💰 Use `/balance 123456` to view your balance.",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    if data == "history":
-
-        rows = db.user_history(
-            query.from_user.id
-        )
-
-        if not rows:
-
+        if not auctions:
             await query.message.reply_text(
-                "📊 No auction history yet."
+                "🔴 No live auctions."
             )
-
             return
 
-        text = "📊 *AUCTION HISTORY*\n\n"
+        text = "🔴 *LIVE AUCTIONS*\n\n"
 
-        for row in rows:
+        for auction in auctions:
+            count = db.participant_count(
+                auction["id"]
+            )
 
             text += (
-                f"• `{row['code']}` {row['name']} — "
-                f"{row['state']}\n"
-                f"  Won: {row['players_won']} | "
-                f"Spent: {row['spent']:.1f} Cr\n\n"
+                f"🏆 {auction['name']}\n"
+                f"🔑 `{auction['code']}`\n"
+                f"📌 {auction['state']}\n"
+                f"👥 {count}/{auction['max_participants']}\n\n"
             )
 
         await query.message.reply_text(
             text,
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+        )
+
+        return
+
+    if data == "balance_help":
+
+        await query.message.reply_text(
+            "Use:\n\n/balance AUCTION_CODE"
+        )
+
+        return
+
+    if data == "team_help":
+
+        await query.message.reply_text(
+            "Use:\n\n/team AUCTION_CODE"
+        )
+
+        return
+
+    if data == "history_help":
+
+        await query.message.reply_text(
+            "Use:\n\n/history"
         )
 
         return
@@ -1837,45 +850,15 @@ async def button(
 
         await query.message.reply_text(
             "❓ *HELP*\n\n"
-            "/createauction — create auction\n"
-            "/join CODE — join auction\n"
-            "/live — live auctions\n"
-            "/balance CODE — balance\n"
-            "/team CODE — team\n"
-            "/auction CODE — dashboard\n"
-            "/mybids CODE — bid history\n"
-            "/history — history",
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # VIEW AUCTION
-    # -----------------------------------------------------
-
-    if data.startswith("view:"):
-
-        code_value = data.split(
-            ":",
-            1
-        )[1]
-
-        auction = db.get_auction(
-            code_value
-        )
-
-        if not auction:
-
-            await query.message.reply_text(
-                "❌ Auction not found."
-            )
-
-            return
-
-        await query.message.reply_text(
-            auction_text(auction),
-            parse_mode="Markdown"
+            "/start\n"
+            "/createauction\n"
+            "/join CODE\n"
+            "/live\n"
+            "/balance CODE\n"
+            "/team CODE\n"
+            "/auction CODE\n"
+            "/history",
+            parse_mode="Markdown",
         )
 
         return
@@ -1883,30 +866,37 @@ async def button(
     # -----------------------------------------------------
     # BID
     # -----------------------------------------------------
-
-        if data.startswith("bid:"):
+if data.startswith("bid:"):
 
         parts = data.split(":")
 
         if len(parts) != 3:
+
             await query.message.reply_text(
                 "❌ Invalid bid."
             )
+
             return
 
         try:
+
             increment = float(parts[1])
             code_value = parts[2]
+
         except ValueError:
+
             await query.message.reply_text(
                 "❌ Invalid bid amount."
             )
+
             return
 
         if increment < 0.5 or increment > 2.0:
+
             await query.message.reply_text(
                 "❌ Bid increment must be between 0.5 Cr and 2.0 Cr."
             )
+
             return
 
         auction = db.get_auction(
@@ -1914,9 +904,11 @@ async def button(
         )
 
         if not auction:
+
             await query.message.reply_text(
                 "❌ Auction not found."
             )
+
             return
 
         participant = db.participant(
@@ -1925,15 +917,19 @@ async def button(
         )
 
         if not participant:
+
             await query.message.reply_text(
                 "❌ You are not a participant."
             )
+
             return
 
         if auction["state"] != "RUNNING":
+
             await query.message.reply_text(
                 "❌ Bidding is not currently active."
             )
+
             return
 
         player = db.current_player(
@@ -1941,12 +937,15 @@ async def button(
         )
 
         if not player:
+
             await query.message.reply_text(
                 "❌ No active player."
             )
+
             return
 
         try:
+
             result = db.bid(
                 auction["id"],
                 query.from_user.id,
@@ -1963,6 +962,7 @@ async def button(
             await query.message.reply_text(
                 "❌ Bid failed. Please try again."
             )
+
             return
 
         if isinstance(result, tuple):
@@ -1982,21 +982,18 @@ async def button(
             )
 
         return
-
-    # -----------------------------------------------------
+# -----------------------------------------------------
     # CURRENT BIDS
     # -----------------------------------------------------
 
     if data.startswith("bids:"):
 
-        code_value = data.split(
+        code = data.split(
             ":",
             1
         )[1]
 
-        auction = db.get_auction(
-            code_value
-        )
+        auction = db.get_auction(code)
 
         if not auction:
 
@@ -2013,7 +1010,7 @@ async def button(
         if not player:
 
             await query.message.reply_text(
-                "ℹ️ No active player."
+                "❌ No active player."
             )
 
             return
@@ -2023,26 +1020,35 @@ async def button(
             player["id"]
         )
 
-        text = (
-            f"📊 *BID HISTORY*\n\n"
-            f"🔨 {player['name']}\n\n"
-        )
+        if not rows:
 
-        if rows:
-
-            text += "\n".join(
-                f"{row['amount']:.1f} Cr — "
-                f"@{row['username'] or row['first_name']}"
-                for row in rows
+            await query.message.reply_text(
+                f"📊 No bids yet for {player['name']}."
             )
 
-        else:
+            return
 
-            text += "No bids yet."
+        text = (
+            f"📊 *BID HISTORY*\n\n"
+            f"⚽ {player['name']}\n\n"
+        )
+
+        for row in reversed(rows):
+
+            username = (
+                row["username"]
+                or row["first_name"]
+                or "Player"
+            )
+
+            text += (
+                f"👤 {username} — "
+                f"{row['amount']:.1f} Cr\n"
+            )
 
         await query.message.reply_text(
             text,
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
 
         return
@@ -2053,14 +1059,12 @@ async def button(
 
     if data.startswith("bal:"):
 
-        code_value = data.split(
+        code = data.split(
             ":",
             1
         )[1]
 
-        auction = db.get_auction(
-            code_value
-        )
+        auction = db.get_auction(code)
 
         if not auction:
 
@@ -2084,27 +1088,24 @@ async def button(
             return
 
         await query.message.reply_text(
-            f"💰 Your balance: "
-            f"*{participant['balance']:.1f} Cr*",
-            parse_mode="Markdown"
+            f"💰 Your balance:\n\n"
+            f"{participant['balance']:.1f} Cr"
         )
 
         return
-
+    #
+    i# -----------------------------------------------------
+    # TEAM BUTTON
     # -----------------------------------------------------
-    # SKIP BUTTON
-    # -----------------------------------------------------
 
-    if data.startswith("skip:"):
+    if data.startswith("team:"):
 
-        code_value = data.split(
+        code = data.split(
             ":",
             1
         )[1]
 
-        auction = db.get_auction(
-            code_value
-        )
+        auction = db.get_auction(code)
 
         if not auction:
 
@@ -2114,89 +1115,323 @@ async def button(
 
             return
 
-        if not can_control(
-            auction,
+        holdings = db.my_holdings(
+            auction["id"],
             query.from_user.id
-        ):
+        )
+
+        if not holdings:
 
             await query.message.reply_text(
-                "❌ Only the host/admin can skip players."
+                "👥 Your team is empty."
             )
 
             return
 
-        result = db.mark_unsold_and_next(
+        text = "👥 *MY TEAM*\n\n"
+
+        total = 0
+
+        for index, row in enumerate(
+            holdings,
+            start=1
+        ):
+
+            text += (
+                f"{index}. ⚽ {row['name']} — "
+                f"{row['price']:.1f} Cr\n"
+            )
+
+            total += row["price"]
+
+        text += (
+            f"\n💰 Total spent: {total:.1f} Cr"
+        )
+
+        await query.message.reply_text(
+            text,
+            parse_mode="Markdown",
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # START AUCTION
+    # -----------------------------------------------------
+
+    if data.startswith("start:"):
+
+        code = data.split(
+            ":",
+            1
+        )[1]
+
+        auction = db.get_auction(code)
+
+        if not auction:
+
+            await query.message.reply_text(
+                "❌ Auction not found."
+            )
+
+            return
+
+        ok, message = db.start_auction(
+            auction["id"],
+            query.from_user.id
+        )
+
+        await query.message.reply_text(
+            ("✅ " if ok else "❌ ")
+            + str(message)
+        )
+
+        if ok:
+
+            updated = db.get_auction(code)
+
+            await send_auction_dashboard(
+                update,
+                updated
+            )
+
+        return
+        # -----------------------------------------------------
+    # PAUSE
+    # -----------------------------------------------------
+
+    if data.startswith("pause:"):
+
+        code = data.split(
+            ":",
+            1
+        )[1]
+
+        auction = db.get_auction(code)
+
+        if not auction:
+
+            await query.message.reply_text(
+                "❌ Auction not found."
+            )
+
+            return
+
+        if auction["host_id"] != query.from_user.id:
+
+            await query.message.reply_text(
+                "❌ Only the host can pause."
+            )
+
+            return
+
+        if auction["state"] != "RUNNING":
+
+            await query.message.reply_text(
+                "❌ Auction is not running."
+            )
+
+            return
+
+        db.set_state(
+            auction["id"],
+            "PAUSED"
+        )
+
+        await query.message.reply_text(
+            "⏸ Auction paused."
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # RESUME
+    # -----------------------------------------------------
+
+    if data.startswith("resume:"):
+
+        code = data.split(
+            ":",
+            1
+        )[1]
+
+        auction = db.get_auction(code)
+
+        if not auction:
+
+            await query.message.reply_text(
+                "❌ Auction not found."
+            )
+
+            return
+
+        if auction["host_id"] != query.from_user.id:
+
+            await query.message.reply_text(
+                "❌ Only the host can resume."
+            )
+
+            return
+
+        if auction["state"] != "PAUSED":
+
+            await query.message.reply_text(
+                "❌ Auction is not paused."
+            )
+
+            return
+
+        db.set_state(
+            auction["id"],
+            "RUNNING"
+        )
+
+        await query.message.reply_text(
+            "▶️ Auction resumed."
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # SELL / NEXT PLAYER
+    # -----------------------------------------------------
+
+    if data.startswith("sell:"):
+
+        code = data.split(
+            ":",
+            1
+        )[1]
+
+        auction = db.get_auction(code)
+
+        if not auction:
+
+            await query.message.reply_text(
+                "❌ Auction not found."
+            )
+
+            return
+
+        if auction["host_id"] != query.from_user.id:
+
+            await query.message.reply_text(
+                "❌ Only the host can sell/next."
+            )
+
+            return
+
+        result = db.sell_current(
             auction["id"]
         )
 
         if not result:
 
             await query.message.reply_text(
-                "❌ No active player."
+                "❌ No current player."
             )
 
             return
 
-        if result["next"]:
+        sold_player = result["sold_player"]
+        last = result["last"]
+        next_player = result["next"]
+
+        if last:
 
             await query.message.reply_text(
-                "⏭ Player skipped."
-            )
-
-            await announce_current(
-                auction["id"],
-                context
+                f"🔨 *SOLD!*\n\n"
+                f"⚽ {sold_player['name']}\n"
+                f"💰 {last['amount']:.1f} Cr\n"
+                f"👤 User ID: {last['user_id']}",
+                parse_mode="Markdown",
             )
 
         else:
 
             await query.message.reply_text(
-                "🏁 Auction completed."
+                f"❌ *UNSOLD*\n\n"
+                f"⚽ {sold_player['name']}",
+                parse_mode="Markdown",
+            )
+
+        if next_player:
+
+            updated = db.get_auction(code)
+
+            await send_auction_dashboard(
+                update,
+                updated
+            )
+
+        else:
+
+            await query.message.reply_text(
+                "🏁 *Auction completed!*",
+                parse_mode="Markdown",
             )
 
         return
+        # -----------------------------------------------------
+    # STATS
+    # -----------------------------------------------------
 
+    if data.startswith("stats:"):
 
-# =========================================================
-# LIVE AUCTION CALLBACK
-# =========================================================
+        code = data.split(
+            ":",
+            1
+        )[1]
 
-async def show_live_callback(query):
+        auction = db.get_auction(code)
 
-    auctions = db.live_auctions()
+        if not auction:
 
-    if not auctions:
+            await query.message.reply_text(
+                "❌ Auction not found."
+            )
+
+            return
+
+        if auction["host_id"] != query.from_user.id:
+
+            await query.message.reply_text(
+                "❌ Only the host can view this."
+            )
+
+            return
+
+        stats = db.stats(
+            auction["id"]
+        )
 
         await query.message.reply_text(
-            "🔥 No live auctions currently."
+            f"📊 *AUCTION STATS*\n\n"
+            f"⚽ Players: {stats['players']}\n"
+            f"✅ Sold: {stats['sold']}\n"
+            f"❌ Unsold: {stats['unsold']}\n"
+            f"⏳ Pending: {stats['pending']}\n"
+            f"👥 Participants: {stats['participants']}",
+            parse_mode="Markdown",
         )
 
         return
 
-    buttons = []
 
-    for auction in auctions:
+# =========================================================
+# TELEGRAM APPLICATION
+# =========================================================
 
-        buttons.append([
-            InlineKeyboardButton(
-                f"🎯 {auction['name']} #{auction['code']}",
-                callback_data=f"view:{auction['code']}"
-            )
-        ])
-
-    await query.message.reply_text(
-        "🔥 *LIVE AUCTIONS*",
-        parse_mode="Markdown",
-        reply_markup=kb(buttons)
-    )
+BOT = Application.builder().token(
+    BOT_TOKEN
+).build()
 
 
 # =========================================================
-# CONVERSATION HANDLER
+# CREATE CONVERSATION
 # =========================================================
 
 create_conversation = ConversationHandler(
-
     entry_points=[
         CommandHandler(
             "createauction",
@@ -2209,7 +1444,6 @@ create_conversation = ConversationHandler(
     ],
 
     states={
-
         CREATE_NAME: [
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -2217,10 +1451,10 @@ create_conversation = ConversationHandler(
             )
         ],
 
-        CREATE_LIMIT: [
+        CREATE_PARTICIPANTS: [
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
-                create_limit
+                create_participants
             )
         ],
 
@@ -2235,22 +1469,13 @@ create_conversation = ConversationHandler(
     fallbacks=[
         CommandHandler(
             "cancel",
-            cancel_create
+            create_cancel
         )
     ],
-
-    per_user=True,
-    per_chat=True,
 )
 
 
-# =========================================================
-# REGISTER HANDLERS
-# =========================================================
-
-BOT.add_handler(
-    create_conversation
-)
+BOT.add_handler(create_conversation)
 
 BOT.add_handler(
     CommandHandler(
@@ -2262,154 +1487,49 @@ BOT.add_handler(
 BOT.add_handler(
     CommandHandler(
         "help",
-        help_cmd
+        help_command
     )
 )
 
 BOT.add_handler(
     CommandHandler(
         "join",
-        join
+        join_command
     )
 )
 
 BOT.add_handler(
     CommandHandler(
         "live",
-        live
+        live_command
     )
 )
 
 BOT.add_handler(
     CommandHandler(
         "auction",
-        auction_view
+        auction_command
     )
 )
 
 BOT.add_handler(
     CommandHandler(
         "balance",
-        balance
+        balance_command
     )
 )
 
 BOT.add_handler(
     CommandHandler(
         "team",
-        team
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "mybids",
-        mybids
+        team_command
     )
 )
 
 BOT.add_handler(
     CommandHandler(
         "history",
-        history
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "startauction",
-        startauction
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "pauseauction",
-        pause
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "resumeauction",
-        resume
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "stopauction",
-        stop
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "addplayer",
-        addplayer
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "removeplayer",
-        removeplayer
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "reauction",
-        reauction
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "skip",
-        skip
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "unsold",
-        unsold
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "participants",
-        participants
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "auctionstats",
-        auctionstats
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "results",
-        results
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "admin",
-        admin
-    )
-)
-
-BOT.add_handler(
-    CommandHandler(
-        "broadcast",
-        broadcast
+        history_command
     )
 )
 
@@ -2419,30 +1539,37 @@ BOT.add_handler(
     )
 )
 
-
 # =========================================================
-# FASTAPI
+# FASTAPI LIFESPAN
 # =========================================================
 
 @asynccontextmanager
 async def lifespan(app):
 
+    # IMPORTANT:
+    # Create all SQLite tables before Telegram starts.
     db.init_db()
 
-    log.info("Starting Telegram bot...")
+    log.info(
+        "Starting Telegram bot..."
+    )
 
     await BOT.initialize()
     await BOT.start()
 
     webhook_url = (
-        PUBLIC_URL.rstrip("/")
-        + "/telegram/webhook"
+        PUBLIC_URL
+        + WEBHOOK_PATH
     )
 
     await BOT.bot.set_webhook(
         url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
         allowed_updates=Update.ALL_TYPES,
+        secret_token=(
+            WEBHOOK_SECRET
+            if WEBHOOK_SECRET
+            else None
+        ),
     )
 
     log.info(
@@ -2452,25 +1579,31 @@ async def lifespan(app):
 
     yield
 
-    log.info("Stopping Telegram bot...")
-
     try:
-        await BOT.bot.delete_webhook()
+
+        await BOT.stop()
+        await BOT.shutdown()
+
     except Exception:
-        pass
 
-    await BOT.stop()
-    await BOT.shutdown()
+        log.exception(
+            "Telegram shutdown failed"
+        )
 
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
 
 app = FastAPI(
     title="eFootball Auction Bot",
-    lifespan=lifespan
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 
 # =========================================================
-# HEALTH CHECK
+# HEALTH
 # =========================================================
 
 @app.get("/")
@@ -2478,7 +1611,7 @@ async def root():
 
     return {
         "status": "ok",
-        "service": "eFootball Auction Bot"
+        "service": "efootball-auction-bot",
     }
 
 
@@ -2494,45 +1627,35 @@ async def health():
 # TELEGRAM WEBHOOK
 # =========================================================
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(
+    request: Request
+):
 
-    received_secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token"
+    if WEBHOOK_SECRET:
+
+        incoming_secret = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token"
+        )
+
+        if incoming_secret != WEBHOOK_SECRET:
+
+            raise HTTPException(
+                status_code=403,
+                detail="Invalid webhook secret",
+            )
+
+    data = await request.json()
+
+    update = Update.de_json(
+        data,
+        BOT.bot
     )
 
-    if received_secret != WEBHOOK_SECRET:
+    await BOT.update_queue.put(
+        update
+    )
 
-        raise HTTPException(
-            status_code=403,
-            detail="forbidden"
-        )
-
-    try:
-
-        data = await request.json()
-
-        update = Update.de_json(
-            data,
-            BOT.bot
-        )
-
-        await BOT.process_update(
-            update
-        )
-
-        return {
-            "ok": True
-        }
-
-    except Exception as error:
-
-        log.exception(
-            "Webhook processing error: %s",
-            error
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail="Webhook processing failed"
-        )
+    return {
+        "ok": True
+}
