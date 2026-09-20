@@ -1847,26 +1847,20 @@ def run_bot():
 # ============================================================
 
 if __name__ == "__main__":
-
-    logger.info(
-        "Starting eFootball Auction Bot..."
-    )
-
-    # Start FastAPI server
-    # in background thread
+    print("🚀 Starting eFootball Auction Bot...")
 
     api_thread = threading.Thread(
         target=lambda: uvicorn.run(
             app,
-            host=HOST,
-            port=PORT,
-            log_level="info"
+            host="0.0.0.0",
+            port=PORT
         ),
         daemon=True
     )
 
     api_thread.start()
 
-    # Start Telegram bot
+    print("🌐 FastAPI server started")
+    print("🤖 Starting Telegram bot...")
 
     run_bot()
