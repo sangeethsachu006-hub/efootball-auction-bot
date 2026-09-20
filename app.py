@@ -1922,7 +1922,7 @@ async def button(
 
         try:
 
-            result = db.place_bid(
+            result = db.bid(
                 auction["id"],
                 query.from_user.id
             )
@@ -2400,6 +2400,8 @@ BOT.add_handler(
 
 @asynccontextmanager
 async def lifespan(app):
+
+    db.init_db()
 
     log.info("Starting Telegram bot...")
 
