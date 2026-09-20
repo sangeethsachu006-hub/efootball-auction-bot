@@ -207,39 +207,142 @@ def current_player(aid):
             return None
         return c.execute("SELECT * FROM players WHERE id=?", (a["current_player_id"],)).fetchone()
 
-def bid(aid,user_id):
+def bid(aid, user_id, increment=0.5):
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        a=c.execute("SELECT * FROM auctions WHERE id=?", (aid,)).fetchone()
+
+        increment = round(float(increment), 2)
+
+        # After the first bid, each increment must be 0.5 to 2.0 Cr
+        if increment < 0.5 or increment > 2.0:
+            c.execute("ROLLBACK")
+            return (
+                False,
+                "Bid increment must be between 0.5 Cr and 2.0 Cr.",
+                None
+            )
+
+        # Check auction
+        a = c.execute(
+            "SELECT * FROM auctions WHERE id=?",
+            (aid,)
+        ).fetchone()
+
         if not a or a["state"] != "RUNNING" or not a["current_player_id"]:
             c.execute("ROLLBACK")
-            return False,"Auction is not accepting bids.",None
-        p=c.execute("SELECT * FROM players WHERE id=?", (a["current_player_id"],)).fetchone()
+            return (
+                False,
+                "Auction is not accepting bids.",
+                None
+            )
+
+        # Current player
+        p = c.execute(
+            "SELECT * FROM players WHERE id=?",
+            (a["current_player_id"],)
+        ).fetchone()
+
         if not p or p["status"] != "CURRENT":
             c.execute("ROLLBACK")
-            return False,"No active player.",None
-        part=c.execute("SELECT * FROM participants WHERE auction_id=? AND user_id=?", (aid,user_id)).fetchone()
+            return False, "No active player.", None
+
+        # Check participant
+        part = c.execute(
+            """SELECT * FROM participants
+               WHERE auction_id=? AND user_id=?""",
+            (aid, user_id)
+        ).fetchone()
+
         if not part:
             c.execute("ROLLBACK")
-            return False,"Join the auction first.",None
-        last=c.execute("SELECT * FROM bids WHERE auction_id=? AND player_id=? ORDER BY id DESC LIMIT 1",
-                       (aid,p["id"])).fetchone()
-        if last and last["user_id"] == user_id:
-            c.execute("ROLLBACK")
-            return False,"You are already the highest bidder.",None
-        new_amount = 2.0 if not last else round(last["amount"] + 0.5, 2)
+            return False, "Join the auction first.", None
+
+        # Get previous highest bid
+        last = c.execute(
+            """SELECT * FROM bids
+               WHERE auction_id=? AND player_id=?
+               ORDER BY id DESC LIMIT 1""",
+            (aid, p["id"])
+        ).fetchone()
+
+        # First bid is ALWAYS exactly 2.0 Cr
+        if not last:
+            new_amount = 2.0
+
+        else:
+            # Cannot bid against yourself
+            if last["user_id"] == user_id:
+                c.execute("ROLLBACK")
+                return (
+                    False,
+                    "You are already the highest bidder.",
+                    None
+                )
+
+            # Every later bid increases by 0.5–2.0 Cr
+            new_amount = round(
+                last["amount"] + increment,
+                2
+            )
+
+        # Check balance
         if part["balance"] + 1e-9 < new_amount:
             c.execute("ROLLBACK")
-            return False,f"Insufficient balance. You need {new_amount:.1f} Cr.",None
+            return (
+                False,
+                f"Insufficient balance. You need {new_amount:.1f} Cr.",
+                None
+            )
+
+        # Refund previous highest bidder
         if last:
-            c.execute("UPDATE participants SET balance=balance+? WHERE auction_id=? AND user_id=?",
-                      (last["amount"],aid,last["user_id"]))
-        c.execute("UPDATE participants SET balance=balance-? WHERE auction_id=? AND user_id=?",
-                  (new_amount,aid,user_id))
-        c.execute("INSERT INTO bids(auction_id,player_id,user_id,amount) VALUES(?,?,?,?)",
-                  (aid,p["id"],user_id,new_amount))
+            c.execute(
+                """UPDATE participants
+                   SET balance=balance+?
+                   WHERE auction_id=? AND user_id=?""",
+                (
+                    last["amount"],
+                    aid,
+                    last["user_id"]
+                )
+            )
+
+        # Deduct new bidder balance
+        c.execute(
+            """UPDATE participants
+               SET balance=balance-?
+               WHERE auction_id=? AND user_id=?""",
+            (
+                new_amount,
+                aid,
+                user_id
+            )
+        )
+
+        # Save bid
+        c.execute(
+            """INSERT INTO bids
+               (auction_id, player_id, user_id, amount)
+               VALUES (?,?,?,?)""",
+            (
+                aid,
+                p["id"],
+                user_id,
+                new_amount
+            )
+        )
+
         c.execute("COMMIT")
-        return True,"Bid accepted",{"player":p,"amount":new_amount,"previous":last}
+
+        return (
+            True,
+            f"Bid accepted: {new_amount:.1f} Cr",
+            {
+                "player": p,
+                "amount": new_amount,
+                "previous": last
+            }
+        )
 
 def sell_current(aid):
     with conn() as c:
