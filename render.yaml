@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: efootball-auction-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: INITIAL_BALANCE
+        value: "100"
+      - key: BID_SECONDS
+        value: "30"
+      - key: DB_PATH
+        value: "auction.db"
