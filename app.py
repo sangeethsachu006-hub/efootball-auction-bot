@@ -1,14 +1,18 @@
 import os
-import json
 import asyncio
 import threading
-from http.server import
-BaseHTTPRequestHandler, HTTPServer
 import logging
-from datetime import datetime, timedelta
-from threading import Lock
+from decimal import Decimal, InvalidOperation
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from fastapi import FastAPI
+import uvicorn
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,35 +20,33 @@ from telegram.ext import (
     ContextTypes,
 )
 
+from db import db
+
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
+# Put your Telegram numeric user ID here.
+# Example:
+# ADMIN_IDS = {123456789}
 ADMIN_IDS = {
-    # Add Telegram numeric user IDs here.
-    # Example:
-    # 123456789,
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
 }
 
-DATA_FILE = "auction_data.json"
+HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", "8080"))
 
-MAX_PARTICIPANTS = 500
-MAX_PLAYERS = 500
+AUCTION_DURATION = 30
 
-STARTING_BALANCE = 100.0
-MIN_START_BID = 2.0
-MIN_INCREMENT = 0.5
-MAX_INCREMENT = 2.0
-
-AUCTION_DURATION = 30  # seconds
-
-CURRENCY = "Cr"
-
-# ============================================================
-# LOGGING
-# ============================================================
+MIN_START_BID = Decimal("2.0")
+MIN_INCREMENT = Decimal("0.5")
+MAX_INCREMENT = Decimal("2.0")
+STARTING_BALANCE = Decimal("100.0")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,390 +55,391 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-data_lock = Lock()
 
 # ============================================================
-# DEFAULT DATA
+# FASTAPI KEEP-ALIVE SERVER
 # ============================================================
 
-DEFAULT_DATA = {
-    "participants": {},
-    "players": {},
-    "auction": {
-        "active": False,
-        "player_id": None,
-        "highest_bid": 0,
-        "highest_bidder": None,
-        "started_at": None,
-        "ends_at": None,
-        "bid_history": [],
-    },
-    "settings": {
-        "auction_duration": AUCTION_DURATION,
-    },
-}
+api = FastAPI(title="eFootball Auction Bot")
+
+
+@api.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "eFootball Auction Bot"
+    }
+
+
+@api.get("/health")
+async def health():
+    return {
+        "status": "healthy"
+    }
+
+
+class KeepAliveHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(
+            b'{"status":"online","service":"eFootball Auction Bot"}'
+        )
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_http_server():
+    server = HTTPServer(
+        (HOST, PORT),
+        KeepAliveHandler
+    )
+
+    logger.info(
+        "Keep-alive server running on port %s",
+        PORT
+    )
+
+    server.serve_forever()
+
 
 # ============================================================
-# DATABASE
+# GLOBAL AUCTION LOCK
 # ============================================================
 
+auction_lock = asyncio.Lock()
 
-def load_data():
-    with data_lock:
-        if not os.path.exists(DATA_FILE):
-            save_data(DEFAULT_DATA)
-            return json.loads(json.dumps(DEFAULT_DATA))
+auction_tasks = {}
 
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            # Safety defaults
-            data.setdefault("participants", {})
-            data.setdefault("players", {})
-            data.setdefault("auction", DEFAULT_DATA["auction"].copy())
-            data.setdefault("settings", DEFAULT_DATA["settings"].copy())
-
-            return data
-
-        except Exception:
-            logger.exception("Could not load database.")
-            return json.loads(json.dumps(DEFAULT_DATA))
-
-
-def save_data(data):
-    with data_lock:
-        temp_file = DATA_FILE + ".tmp"
-
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-
-        os.replace(temp_file, DATA_FILE)
-
-
-data = load_data()
 
 # ============================================================
 # UTILITY FUNCTIONS
 # ============================================================
 
-
-def is_admin(user_id):
+def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-def format_cr(amount):
-    return f"{amount:.1f} Cr"
+def format_cr(value) -> str:
+    try:
+        number = Decimal(str(value))
+        return f"{number:.1f} Cr"
+    except Exception:
+        return f"{value} Cr"
 
 
-def get_user(user_id):
-    return data["participants"].get(str(user_id))
+def parse_amount(value: str):
+    try:
+        amount = Decimal(value)
+
+        if amount <= 0:
+            return None
+
+        return amount.quantize(Decimal("0.1"))
+
+    except (InvalidOperation, ValueError):
+        return None
 
 
-def get_player(player_id):
-    return data["players"].get(str(player_id))
+def get_user_name(user) -> str:
+    if user.username:
+        return f"@{user.username}"
+
+    full_name = user.full_name
+
+    if full_name:
+        return full_name
+
+    return str(user.id)
 
 
-def next_player_id():
-    if not data["players"]:
-        return 1
-
-    return max(int(x) for x in data["players"].keys()) + 1
-
-
-def next_player_order():
-    return len(data["players"]) + 1
-
-
-def remaining_balance(user_id):
-    user = get_user(user_id)
-
-    if not user:
-        return 0
-
-    return round(
-        user["budget"] - user["spent"],
-        2,
-    )
-
-
-def player_display(player):
-    return (
-        f"⚽ <b>{player['name']}</b>\n"
-        f"🆔 Player ID: <code>{player['id']}</code>"
-    )
-
-
-def participant_display(user):
-    return (
-        f"👤 <b>{user['name']}</b>\n"
-        f"💰 Balance: <b>{format_cr(remaining_balance(user['id']))}</b>\n"
-        f"💸 Spent: <b>{format_cr(user['spent'])}</b>\n"
-        f"⚽ Players: <b>{len(user['squad'])}</b>"
-    )
-
-
-def auction_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "+0.5 Cr",
-                    callback_data="bid_0.5",
-                ),
-                InlineKeyboardButton(
-                    "+1 Cr",
-                    callback_data="bid_1",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "+1.5 Cr",
-                    callback_data="bid_1.5",
-                ),
-                InlineKeyboardButton(
-                    "+2 Cr",
-                    callback_data="bid_2",
-                ),
-            ],
-        ]
-    )
-
-
-def auction_status_text():
-    auction = data["auction"]
-
-    if not auction["active"]:
-        return "🔴 No auction is currently active."
-
-    player = get_player(auction["player_id"])
-
-    if not player:
-        return "❌ Auction player not found."
-
-    if auction["highest_bidder"]:
-        bidder = get_user(auction["highest_bidder"])
-        bidder_name = bidder["name"] if bidder else "Unknown"
-    else:
-        bidder_name = "No bids yet"
-
-    ends_at = auction["ends_at"]
+async def safe_edit(query, text, keyboard=None):
 
     try:
-        remaining = max(
-            0,
-            int(
-                (
-                    datetime.fromisoformat(ends_at)
-                    - datetime.now()
-                ).total_seconds()
-            ),
-        )
-    except Exception:
-        remaining = 0
-
-    return (
-        f"🔥 <b>LIVE AUCTION</b>\n\n"
-        f"⚽ <b>{player['name']}</b>\n"
-        f"🆔 Player ID: <code>{player['id']}</code>\n\n"
-        f"💰 Current Bid: <b>{format_cr(auction['highest_bid'])}</b>\n"
-        f"👑 Highest Bidder: <b>{bidder_name}</b>\n"
-        f"⏱️ Time Left: <b>{remaining}s</b>\n\n"
-        f"📈 Bid increment: <b>0.5–2 Cr</b>\n"
-        f"💳 Maximum budget/player rules apply."
-    )
-
-
-# ============================================================
-# PARTICIPANT COMMANDS
-# ============================================================
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🏆 <b>eFootball Auction Bot</b>\n\n"
-        "Welcome!\n\n"
-        "💰 Starting Budget: <b>100 Cr</b>\n"
-        "💵 Starting Bid: <b>2 Cr</b>\n"
-        "📈 Bid Increment: <b>0.5–2 Cr</b>\n"
-        "⏱️ Auction Duration: <b>30 seconds</b>\n"
-        f"👥 Maximum Participants: <b>{MAX_PARTICIPANTS}</b>\n"
-        f"⚽ Maximum Players: <b>{MAX_PLAYERS}</b>\n\n"
-        "Use /help to see all commands."
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📖 <b>eFootball Auction Commands</b>\n\n"
-
-        "👤 <b>Participant Commands</b>\n"
-        "/register - Register for auction\n"
-        "/balance - Check your balance\n"
-        "/squad - View your purchased players\n"
-        "/players - View auction players\n"
-        "/leaderboard - View participants\n"
-        "/auction - View current auction\n"
-        "/history - View current bid history\n\n"
-
-        "👑 <b>Admin Commands</b>\n"
-        "/addplayer Name - Add player\n"
-        "/removeplayer ID - Remove player\n"
-        "/startauction ID - Start player auction\n"
-        "/skip - Skip current player\n"
-        "/stop - Stop current auction\n"
-        "/cancel - Cancel current auction\n"
-        "/participants - View participants\n"
-        "/reset - Reset entire auction\n"
-        "/announce Message - Send announcement\n\n"
-
-        "💡 <b>Bid</b>\n"
-        "You can use the buttons shown below an active auction.\n\n"
-
-        "⚠️ Auction lasts exactly <b>30 seconds</b>.\n"
-        "If nobody bids → <b>UNSOLD</b>.\n"
-        "If bids exist → highest bidder gets the player."
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    user_id = str(user.id)
-
-    if user_id in data["participants"]:
-        await update.message.reply_text(
-            "⚠️ You are already registered."
-        )
-        return
-
-    if len(data["participants"]) >= MAX_PARTICIPANTS:
-        await update.message.reply_text(
-            "❌ Participant limit reached.\n"
-            f"Maximum: {MAX_PARTICIPANTS}"
-        )
-        return
-
-    participant = {
-        "id": user.id,
-        "name": user.full_name,
-        "username": user.username or "",
-        "budget": STARTING_BALANCE,
-        "spent": 0.0,
-        "squad": [],
-        "registered_at": datetime.now().isoformat(),
-    }
-
-    data["participants"][user_id] = participant
-    save_data(data)
-
-    await update.message.reply_text(
-        f"✅ <b>Registration successful!</b>\n\n"
-        f"👤 {user.full_name}\n"
-        f"💰 Starting Balance: <b>{format_cr(STARTING_BALANCE)}</b>\n\n"
-        f"Good luck! 🏆",
-        parse_mode="HTML",
-    )
-
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
-
-    if not user:
-        await update.message.reply_text(
-            "❌ You are not registered.\nUse /register"
-        )
-        return
-
-    await update.message.reply_text(
-        participant_display(user),
-        parse_mode="HTML",
-    )
-
-
-async def squad(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
-
-    if not user:
-        await update.message.reply_text(
-            "❌ You are not registered."
-        )
-        return
-
-    if not user["squad"]:
-        await update.message.reply_text(
-            "⚽ Your squad is currently empty."
-        )
-        return
-
-    text = (
-        f"🏟️ <b>{user['name']}'s Squad</b>\n\n"
-    )
-
-    for index, player_id in enumerate(user["squad"], 1):
-        player = get_player(player_id)
-
-        if player:
-            text += (
-                f"{index}. ⚽ {player['name']} — "
-                f"{format_cr(player['sold_price'])}\n"
+        if keyboard:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=keyboard
+            )
+        else:
+            await query.edit_message_text(
+                text=text
             )
 
-    text += (
-        f"\n💰 Remaining: "
-        f"<b>{format_cr(remaining_balance(user['id']))}</b>"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# PLAYER LIST
-# ============================================================
-
-
-async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not data["players"]:
-        await update.message.reply_text(
-            "⚽ No players have been added yet."
+    except Exception as e:
+        logger.warning(
+            "Could not edit Telegram message: %s",
+            e
         )
+
+
+# ============================================================
+# AUCTION KEYBOARD
+# ============================================================
+
+def get_bid_keyboard(current_bid):
+
+    if current_bid is None:
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "💰 2 Cr",
+                    callback_data="bid:2.0"
+                )
+            ]
+        ]
+
+    else:
+
+        current = Decimal(str(current_bid))
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"+0.5 Cr → {current + Decimal('0.5'):.1f}",
+                    callback_data="bid:0.5"
+                ),
+                InlineKeyboardButton(
+                    f"+1 Cr → {current + Decimal('1.0'):.1f}",
+                    callback_data="bid:1.0"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"+1.5 Cr → {current + Decimal('1.5'):.1f}",
+                    callback_data="bid:1.5"
+                ),
+                InlineKeyboardButton(
+                    f"+2 Cr → {current + Decimal('2.0'):.1f}",
+                    callback_data="bid:2.0"
+                )
+            ]
+        ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# AUCTION MESSAGE
+# ============================================================
+
+def build_auction_text(auction, player):
+
+    player_name = player.get("name", "Unknown Player")
+
+    position = player.get("position", "N/A")
+
+    rating = player.get("rating", "N/A")
+
+    current_bid = auction.get("current_bid")
+
+    highest_bidder = auction.get("highest_bidder_name")
+
+    if current_bid is None:
+
+        bid_text = (
+            f"Starting Bid: "
+            f"**{format_cr(MIN_START_BID)}**"
+        )
+
+        bidder_text = "No bids yet"
+
+    else:
+
+        bid_text = (
+            f"Current Bid: "
+            f"**{format_cr(current_bid)}**"
+        )
+
+        if highest_bidder:
+            bidder_text = (
+                f"Highest Bidder: "
+                f"**{highest_bidder}**"
+            )
+        else:
+            bidder_text = "No bids yet"
+
+    text = (
+        "🔥 **PLAYER AUCTION** 🔥\n\n"
+        f"👤 Player: **{player_name}**\n"
+        f"📍 Position: **{position}**\n"
+        f"⭐ Rating: **{rating}**\n\n"
+        f"💰 {bid_text}\n"
+        f"👑 {bidder_text}\n\n"
+        "⏱️ Auction Duration: **30 seconds**\n"
+        "📈 Minimum Increment: **0.5 Cr**\n"
+        "📈 Maximum Increment: **2 Cr**\n\n"
+        "⚠️ Timer will NOT reset after a bid."
+    )
+
+    return text
+
+
+# ============================================================
+# REGISTER PARTICIPANT
+# ============================================================
+
+async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    if not user:
         return
 
-    text = "⚽ <b>Auction Players</b>\n\n"
+    try:
 
-    for player_id, player in data["players"].items():
-        status = player["status"]
+        existing = db.get_participant(user.id)
 
-        if status == "sold":
-            status_text = "✅ SOLD"
-        elif status == "unsold":
-            status_text = "❌ UNSOLD"
-        elif status == "auctioned":
-            status_text = "🔥 LIVE"
-        else:
-            status_text = "⏳ PENDING"
+        if existing:
 
-        text += (
-            f"<code>{player_id}</code>. "
-            f"<b>{player['name']}</b> — {status_text}\n"
+            balance = existing.get(
+                "balance",
+                STARTING_BALANCE
+            )
+
+            await update.message.reply_text(
+                "✅ You are already registered!\n\n"
+                f"👤 {get_user_name(user)}\n"
+                f"💰 Balance: {format_cr(balance)}"
+            )
+
+            return
+
+        participants = db.get_all_participants()
+
+        if len(participants) >= 500:
+
+            await update.message.reply_text(
+                "❌ Participant limit reached.\n"
+                "Maximum participants: 500"
+            )
+
+            return
+
+        db.add_participant(
+            user.id,
+            user.username,
+            user.full_name,
+            float(STARTING_BALANCE)
         )
 
+        await update.message.reply_text(
+            "✅ **Registration Successful!**\n\n"
+            f"👤 {get_user_name(user)}\n"
+            f"💰 Starting Budget: {format_cr(STARTING_BALANCE)}\n\n"
+            "You can now participate in the auction."
+        )
+
+    except Exception as e:
+
+        logger.exception("Registration error")
+
+        await update.message.reply_text(
+            f"❌ Registration failed.\n\n{e}"
+        )
+
+
+# ============================================================
+# BALANCE
+# ============================================================
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    participant = db.get_participant(user.id)
+
+    if not participant:
+
+        await update.message.reply_text(
+            "❌ You are not registered.\n"
+            "Use /register first."
+        )
+
+        return
+
+    current_balance = participant.get(
+        "balance",
+        STARTING_BALANCE
+    )
+
+    spent = (
+        Decimal(str(STARTING_BALANCE))
+        - Decimal(str(current_balance))
+    )
+
     await update.message.reply_text(
-        text,
-        parse_mode="HTML",
+        "💰 **YOUR BALANCE**\n\n"
+        f"Starting Budget: {format_cr(STARTING_BALANCE)}\n"
+        f"Spent: {format_cr(spent)}\n"
+        f"Remaining: {format_cr(current_balance)}"
+    )
+
+
+# ============================================================
+# SQUAD
+# ============================================================
+
+async def squad(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    participant = db.get_participant(user.id)
+
+    if not participant:
+
+        await update.message.reply_text(
+            "❌ Please register first using /register."
+        )
+
+        return
+
+    players = db.get_squad(user.id)
+
+    if not players:
+
+        await update.message.reply_text(
+            "⚽ **YOUR SQUAD**\n\n"
+            "No players purchased yet."
+        )
+
+        return
+
+    lines = [
+        "⚽ **YOUR SQUAD**\n"
+    ]
+
+    total_spent = Decimal("0")
+
+    for index, player in enumerate(players, 1):
+
+        price = Decimal(
+            str(player.get("purchase_price", 0))
+        )
+
+        total_spent += price
+
+        lines.append(
+            f"{index}. **{player.get('name', 'Unknown')}**\n"
+            f"   💰 {format_cr(price)}"
+        )
+
+    lines.append(
+        f"\n💵 Total Spent: {format_cr(total_spent)}"
+    )
+
+    await update.message.reply_text(
+        "\n".join(lines)
     )
 
 
@@ -444,41 +447,737 @@ async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # LEADERBOARD
 # ============================================================
 
-
 async def leaderboard(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    participants = list(
-        data["participants"].values()
-    )
 
-    if not participants:
+    leaders = db.get_leaderboard()
+
+    if not leaders:
+
         await update.message.reply_text(
-            "No participants registered."
+            "📊 No participants registered yet."
         )
+
         return
 
-    participants.sort(
-        key=lambda x: len(x["squad"]),
-        reverse=True,
-    )
+    lines = [
+        "🏆 **LEADERBOARD**\n"
+    ]
 
-    text = "🏆 <b>AUCTION LEADERBOARD</b>\n\n"
+    for index, player in enumerate(leaders, 1):
 
-    for index, user in enumerate(participants, 1):
-        text += (
-            f"{index}. <b>{user['name']}</b>\n"
-            f"   ⚽ Players: {len(user['squad'])}\n"
-            f"   💰 Balance: {format_cr(remaining_balance(user['id']))}\n\n"
+        name = (
+            player.get("username")
+            or player.get("full_name")
+            or str(player.get("user_id"))
         )
 
-        if index >= 50:
-            break
+        balance_value = player.get("balance", 0)
+
+        lines.append(
+            f"{index}. {name} — "
+            f"{format_cr(balance_value)}"
+        )
 
     await update.message.reply_text(
-        text,
-        parse_mode="HTML",
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# PLAYERS LIST
+# ============================================================
+
+async def players(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    player_list = db.get_all_players()
+
+    if not player_list:
+
+        await update.message.reply_text(
+            "📋 No players available."
+        )
+
+        return
+
+    lines = [
+        "📋 **PLAYER LIST**\n"
+    ]
+
+    for player in player_list[:100]:
+
+        status = player.get(
+            "status",
+            "available"
+        )
+
+        lines.append(
+            f"• {player.get('name', 'Unknown')} "
+            f"— {player.get('position', 'N/A')} "
+            f"— {status}"
+        )
+
+    if len(player_list) > 100:
+
+        lines.append(
+            f"\nShowing first 100 of "
+            f"{len(player_list)} players."
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# ADD PLAYER
+# ============================================================
+
+async def addplayer(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    if not is_admin(user.id):
+
+        await update.message.reply_text(
+            "❌ Admin only."
+        )
+
+        return
+
+    if len(context.args) < 3:
+
+        await update.message.reply_text(
+            "Usage:\n"
+            "/addplayer Player Name Position Rating\n\n"
+            "Example:\n"
+            "/addplayer Lionel_Messi RWF 105"
+        )
+
+        return
+
+    name = context.args[0]
+    position = context.args[1]
+
+    try:
+        rating = int(context.args[2])
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ Rating must be a number."
+        )
+
+        return
+
+    try:
+
+        all_players = db.get_all_players()
+
+        if len(all_players) >= 500:
+
+            await update.message.reply_text(
+                "❌ Maximum 500 players allowed."
+            )
+
+            return
+
+        db.add_player(
+            name=name.replace("_", " "),
+            position=position,
+            rating=rating
+        )
+
+        await update.message.reply_text(
+            "✅ Player added successfully!\n\n"
+            f"👤 {name.replace('_', ' ')}\n"
+            f"📍 {position}\n"
+            f"⭐ {rating}"
+        )
+
+    except Exception as e:
+
+        logger.exception("Add player error")
+
+        await update.message.reply_text(
+            f"❌ Failed to add player.\n\n{e}"
+        )
+
+
+# ============================================================
+# START AUCTION
+# ============================================================
+
+async def startauction(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    if not is_admin(user.id):
+
+        await update.message.reply_text(
+            "❌ Admin only."
+        )
+
+        return
+
+    async with auction_lock:
+
+        try:
+
+            active = db.get_active_auction()
+
+            if active:
+
+                await update.message.reply_text(
+                    "⚠️ An auction is already running."
+                )
+
+                return
+
+            if not context.args:
+
+                await update.message.reply_text(
+                    "Usage:\n"
+                    "/startauction PLAYER_ID"
+                )
+
+                return
+
+            try:
+                player_id = int(context.args[0])
+            except ValueError:
+
+                await update.message.reply_text(
+                    "❌ Invalid player ID."
+                )
+
+                return
+
+            player = db.get_player(player_id)
+
+            if not player:
+
+                await update.message.reply_text(
+                    "❌ Player not found."
+                )
+
+                return
+
+            auction = db.start_auction(
+                player_id=player_id,
+                duration=AUCTION_DURATION,
+                min_bid=float(MIN_START_BID)
+            )
+
+            message = await update.message.reply_text(
+                build_auction_text(
+                    auction,
+                    player
+                ),
+                parse_mode="Markdown",
+                reply_markup=get_bid_keyboard(None)
+            )
+
+            auction_message_id = message.message_id
+
+            auction_id = auction.get("id")
+
+            chat_id = update.effective_chat.id
+
+            task = asyncio.create_task(
+                auction_timer(
+                    chat_id,
+                    auction_message_id,
+                    auction_id,
+                    player_id,
+                    context.application
+                )
+            )
+
+            auction_tasks[auction_id] = task
+
+        except Exception as e:
+
+            logger.exception(
+                "Start auction error"
+            )
+
+            await update.message.reply_text(
+                f"❌ Could not start auction.\n\n{e}"
+            )
+
+
+# ============================================================
+# AUCTION TIMER
+# ============================================================
+
+async def auction_timer(
+    chat_id,
+    message_id,
+    auction_id,
+    player_id,
+    application
+):
+
+    try:
+
+        await asyncio.sleep(AUCTION_DURATION)
+
+        async with auction_lock:
+
+            auction = db.get_active_auction()
+
+            if not auction:
+                return
+
+            if auction.get("id") != auction_id:
+                return
+
+            if auction.get("player_id") != player_id:
+                return
+
+            result = db.finish_auction(
+                auction_id
+            )
+
+            player = db.get_player(
+                player_id
+            )
+
+            if not result:
+                return
+
+            status = result.get(
+                "status",
+                "UNSOLD"
+            )
+
+            if status == "SOLD":
+
+                winner_name = result.get(
+                    "winner_name",
+                    "Unknown"
+                )
+
+                winning_bid = result.get(
+                    "winning_bid",
+                    0
+                )
+
+                final_text = (
+                    "🔨 **AUCTION CLOSED**\n\n"
+                    f"👤 Player: **{player.get('name')}**\n\n"
+                    "🟢 **SOLD**\n\n"
+                    f"👑 Winner: **{winner_name}**\n"
+                    f"💰 Final Price: "
+                    f"**{format_cr(winning_bid)}**"
+                )
+
+            else:
+
+                final_text = (
+                    "🔨 **AUCTION CLOSED**\n\n"
+                    f"👤 Player: **{player.get('name')}**\n\n"
+                    "🔴 **UNSOLD**\n\n"
+                    "No valid bids were received."
+                )
+
+            try:
+
+                await application.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=final_text,
+                    parse_mode="Markdown"
+                )
+
+            except Exception as e:
+
+                logger.warning(
+                    "Could not edit closed auction: %s",
+                    e
+                )
+
+            # Send result separately
+            try:
+
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=final_text,
+                    parse_mode="Markdown"
+                )
+
+            except Exception as e:
+
+                logger.warning(
+                    "Could not send auction result: %s",
+                    e
+                )
+
+    except asyncio.CancelledError:
+
+        logger.info(
+            "Auction timer cancelled: %s",
+            auction_id
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Auction timer error"
+        )
+
+    finally:
+
+        auction_tasks.pop(
+            auction_id,
+            None
+        )
+
+
+# ============================================================
+# PLACE BID
+# ============================================================
+
+async def bid_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user = query.from_user
+
+    if not query.data.startswith("bid:"):
+        return
+
+    try:
+
+        increment = Decimal(
+            query.data.split(":")[1]
+        )
+
+    except Exception:
+
+        await query.answer(
+            "Invalid bid.",
+            show_alert=True
+        )
+
+        return
+
+    if increment not in (
+        Decimal("0.5"),
+        Decimal("1.0"),
+        Decimal("1.5"),
+        Decimal("2.0")
+    ):
+
+        await query.answer(
+            "Invalid increment.",
+            show_alert=True
+        )
+
+        return
+
+    async with auction_lock:
+
+        try:
+
+            participant = db.get_participant(
+                user.id
+            )
+
+            if not participant:
+
+                await query.answer(
+                    "Please use /register first.",
+                    show_alert=True
+                )
+
+                return
+
+            auction = db.get_active_auction()
+
+            if not auction:
+
+                await query.answer(
+                    "Auction has already ended.",
+                    show_alert=True
+                )
+
+                return
+
+            player_id = auction.get(
+                "player_id"
+            )
+
+            player = db.get_player(
+                player_id
+            )
+
+            current_bid = auction.get(
+                "current_bid"
+            )
+
+            # ------------------------------------------------
+            # FIRST BID
+            # ------------------------------------------------
+
+            if current_bid is None:
+
+                if increment != Decimal("2.0"):
+
+                    await query.answer(
+                        "First bid must be 2 Cr.",
+                        show_alert=True
+                    )
+
+                    return
+
+                bid_amount = Decimal("2.0")
+
+            # ------------------------------------------------
+            # NEXT BID
+            # ------------------------------------------------
+
+            else:
+
+                current = Decimal(
+                    str(current_bid)
+                )
+
+                bid_amount = (
+                    current + increment
+                )
+
+            # ------------------------------------------------
+            # VALIDATE INCREMENT
+            # ------------------------------------------------
+
+            if current_bid is not None:
+
+                difference = (
+                    bid_amount
+                    - Decimal(str(current_bid))
+                )
+
+                if difference < MIN_INCREMENT:
+
+                    await query.answer(
+                        "Minimum increment is 0.5 Cr.",
+                        show_alert=True
+                    )
+
+                    return
+
+                if difference > MAX_INCREMENT:
+
+                    await query.answer(
+                        "Maximum increment is 2 Cr.",
+                        show_alert=True
+                    )
+
+                    return
+
+            # ------------------------------------------------
+            # CHECK SELF OUTBID
+            # ------------------------------------------------
+
+            highest_bidder_id = auction.get(
+                "highest_bidder_id"
+            )
+
+            if highest_bidder_id == user.id:
+
+                await query.answer(
+                    "You are already the highest bidder.",
+                    show_alert=True
+                )
+
+                return
+
+            # ------------------------------------------------
+            # CHECK BALANCE
+            # ------------------------------------------------
+
+            balance_value = Decimal(
+                str(
+                    participant.get(
+                        "balance",
+                        STARTING_BALANCE
+                    )
+                )
+            )
+
+            if bid_amount > balance_value:
+
+                await query.answer(
+                    f"Insufficient balance.\n"
+                    f"You have {format_cr(balance_value)}",
+                    show_alert=True
+                )
+
+                return
+
+            # ------------------------------------------------
+            # PLACE BID IN DATABASE
+            # ------------------------------------------------
+
+            result = db.place_bid(
+                auction_id=auction.get("id"),
+                user_id=user.id,
+                amount=float(bid_amount),
+                username=user.username,
+                full_name=user.full_name
+            )
+
+            if not result:
+
+                await query.answer(
+                    "Bid could not be placed.",
+                    show_alert=True
+                )
+
+                return
+
+            # ------------------------------------------------
+            # REFRESH AUCTION
+            # ------------------------------------------------
+
+            updated_auction = db.get_active_auction()
+
+            if not updated_auction:
+
+                await query.answer(
+                    "Auction already ended.",
+                    show_alert=True
+                )
+
+                return
+
+            # ------------------------------------------------
+            # UPDATE MESSAGE
+            # ------------------------------------------------
+
+            await safe_edit(
+                query,
+                build_auction_text(
+                    updated_auction,
+                    player
+                ),
+                get_bid_keyboard(
+                    updated_auction.get(
+                        "current_bid"
+                    )
+                )
+            )
+
+            await query.answer(
+                f"Bid placed: {format_cr(bid_amount)}",
+                show_alert=False
+            )
+
+        except Exception as e:
+
+            logger.exception(
+                "Bid error"
+            )
+
+            await query.answer(
+                "An error occurred while placing bid.",
+                show_alert=True
+            )
+
+
+# ============================================================
+# BID HISTORY
+# ============================================================
+
+async def history(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user = update.effective_user
+
+    if not user:
+        return
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage:\n"
+            "/history AUCTION_ID"
+        )
+
+        return
+
+    try:
+
+        auction_id = int(
+            context.args[0]
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ Invalid auction ID."
+        )
+
+        return
+
+    bids = db.get_bid_history(
+        auction_id
+    )
+
+    if not bids:
+
+        await update.message.reply_text(
+            "📜 No bids found."
+        )
+
+        return
+
+    lines = [
+        "📜 **BID HISTORY**\n"
+    ]
+
+    for index, bid in enumerate(
+        bids,
+        1
+    ):
+
+        bidder = (
+            bid.get("username")
+            or bid.get("full_name")
+            or str(bid.get("user_id"))
+        )
+
+        amount = bid.get(
+            "amount",
+            0
+        )
+
+        lines.append(
+            f"{index}. {bidder} — "
+            f"{format_cr(amount)}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
     )
 
 
@@ -486,840 +1185,352 @@ async def leaderboard(
 # CURRENT AUCTION
 # ============================================================
 
-
-async def auction(
+async def current_auction(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not data["auction"]["active"]:
+
+    auction = db.get_active_auction()
+
+    if not auction:
+
         await update.message.reply_text(
-            "🔴 No active auction."
+            "ℹ️ No auction is currently running."
         )
+
         return
 
-    await update.message.reply_text(
-        auction_status_text(),
-        parse_mode="HTML",
-        reply_markup=auction_keyboard(),
+    player = db.get_player(
+        auction.get("player_id")
     )
-
-
-# ============================================================
-# BID PROCESSING
-# ============================================================
-
-
-async def process_bid(
-    update: Update,
-    increment: float,
-):
-    query = update.callback_query
-
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    user = get_user(user_id)
-
-    if not user:
-        await query.answer(
-            "❌ Register first using /register",
-            show_alert=True,
-        )
-        return
-
-    auction_data = data["auction"]
-
-    if not auction_data["active"]:
-        await query.answer(
-            "❌ Auction has ended.",
-            show_alert=True,
-        )
-        return
-
-    now = datetime.now()
-
-    try:
-        end_time = datetime.fromisoformat(
-            auction_data["ends_at"]
-        )
-    except Exception:
-        await query.answer(
-            "❌ Auction timer error.",
-            show_alert=True,
-        )
-        return
-
-    if now >= end_time:
-        await finish_auction(
-            context=query.bot,
-        )
-
-        await query.answer(
-            "⏱️ Auction time is over.",
-            show_alert=True,
-        )
-        return
-
-    current_bid = float(
-        auction_data["highest_bid"]
-    )
-
-    # First bid
-    if current_bid == 0:
-        new_bid = MIN_START_BID
-        actual_increment = MIN_START_BID
-
-        # Button increments are applied after starting bid
-        if increment > MIN_INCREMENT:
-            new_bid = MIN_START_BID + increment
-            actual_increment = increment
-
-    else:
-        new_bid = round(
-            current_bid + increment,
-            2,
-        )
-
-        actual_increment = increment
-
-    # Increment validation
-    if current_bid > 0:
-        if actual_increment < MIN_INCREMENT:
-            await query.answer(
-                "❌ Minimum increment is 0.5 Cr.",
-                show_alert=True,
-            )
-            return
-
-        if actual_increment > MAX_INCREMENT:
-            await query.answer(
-                "❌ Maximum increment is 2 Cr.",
-                show_alert=True,
-            )
-            return
-
-    # Cannot bid against yourself
-    if (
-        auction_data["highest_bidder"] == user_id
-    ):
-        await query.answer(
-            "⚠️ You are already the highest bidder.",
-            show_alert=True,
-        )
-        return
-
-    # Balance validation
-    balance_left = remaining_balance(user_id)
-
-    if new_bid > balance_left:
-        await query.answer(
-            f"❌ Insufficient balance.\n"
-            f"Available: {format_cr(balance_left)}",
-            show_alert=True,
-        )
-        return
-
-    # Save bid
-    auction_data["highest_bid"] = new_bid
-    auction_data["highest_bidder"] = user_id
-
-    auction_data["bid_history"].append(
-        {
-            "user_id": user_id,
-            "name": user["name"],
-            "amount": new_bid,
-            "increment": actual_increment,
-            "time": datetime.now().isoformat(),
-        }
-    )
-
-    save_data(data)
-
-    await query.message.edit_text(
-        auction_status_text(),
-        parse_mode="HTML",
-        reply_markup=auction_keyboard(),
-    )
-
-    await query.answer(
-        f"✅ Bid placed: {format_cr(new_bid)}"
-    )
-
-
-# ============================================================
-# CALLBACK BUTTONS
-# ============================================================
-
-
-async def callback_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-
-    if query.data.startswith("bid_"):
-        value = query.data.replace(
-            "bid_",
-            "",
-        )
-
-        try:
-            increment = float(value)
-        except ValueError:
-            await query.answer(
-                "Invalid bid.",
-                show_alert=True,
-            )
-            return
-
-        await process_bid(
-            update,
-            increment,
-        )
-
-
-# ============================================================
-# ADMIN: ADD PLAYER
-# ============================================================
-
-
-async def add_player(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "❌ Admin only."
-        )
-        return
-
-    if len(data["players"]) >= MAX_PLAYERS:
-        await update.message.reply_text(
-            f"❌ Maximum {MAX_PLAYERS} players allowed."
-        )
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage:\n/addplayer Lionel Messi"
-        )
-        return
-
-    name = " ".join(context.args).strip()
-
-    if len(name) > 100:
-        await update.message.reply_text(
-            "❌ Player name is too long."
-        )
-        return
-
-    player_id = next_player_id()
-
-    data["players"][str(player_id)] = {
-        "id": player_id,
-        "name": name,
-        "status": "pending",
-        "sold_to": None,
-        "sold_price": 0,
-        "created_at": datetime.now().isoformat(),
-    }
-
-    save_data(data)
-
-    await update.message.reply_text(
-        f"✅ Player added.\n\n"
-        f"⚽ <b>{name}</b>\n"
-        f"🆔 ID: <code>{player_id}</code>",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# ADMIN: REMOVE PLAYER
-# ============================================================
-
-
-async def remove_player(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "❌ Admin only."
-        )
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage:\n/removeplayer 1"
-        )
-        return
-
-    try:
-        player_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid player ID."
-        )
-        return
-
-    player = get_player(player_id)
 
     if not player:
+
         await update.message.reply_text(
-            "❌ Player not found."
+            "❌ Player information unavailable."
         )
+
         return
-
-    if player["status"] == "sold":
-        await update.message.reply_text(
-            "❌ Sold players cannot be removed."
-        )
-        return
-
-    if (
-        data["auction"]["active"]
-        and data["auction"]["player_id"] == player_id
-    ):
-        await update.message.reply_text(
-            "❌ Cannot remove the currently auctioned player."
-        )
-        return
-
-    del data["players"][str(player_id)]
-
-    save_data(data)
 
     await update.message.reply_text(
-        "✅ Player removed."
+        build_auction_text(
+            auction,
+            player
+        ),
+        parse_mode="Markdown",
+        reply_markup=get_bid_keyboard(
+            auction.get("current_bid")
+        )
     )
 
 
 # ============================================================
-# ADMIN: START AUCTION
+# SKIP AUCTION
 # ============================================================
 
-
-async def start_auction(
+async def skipauction(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not is_admin(update.effective_user.id):
+
+    user = update.effective_user
+
+    if not is_admin(user.id):
+
         await update.message.reply_text(
             "❌ Admin only."
         )
+
         return
 
-    if data["auction"]["active"]:
+    async with auction_lock:
+
+        auction = db.get_active_auction()
+
+        if not auction:
+
+            await update.message.reply_text(
+                "ℹ️ No active auction."
+            )
+
+            return
+
+        auction_id = auction.get(
+            "id"
+        )
+
+        task = auction_tasks.get(
+            auction_id
+        )
+
+        if task:
+
+            task.cancel()
+
+        result = db.cancel_auction(
+            auction_id
+        )
+
         await update.message.reply_text(
-            "⚠️ Another auction is already active."
+            "⏭️ Current auction skipped."
         )
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Usage:\n/startauction PLAYER_ID"
-        )
-        return
-
-    try:
-        player_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid player ID."
-        )
-        return
-
-    player = get_player(player_id)
-
-    if not player:
-        await update.message.reply_text(
-            "❌ Player not found."
-        )
-        return
-
-    if player["status"] != "pending":
-        await update.message.reply_text(
-            f"❌ Player status is already {player['status']}."
-        )
-        return
-
-    # Check participants
-    if len(data["participants"]) == 0:
-        await update.message.reply_text(
-            "❌ No participants registered."
-        )
-        return
-
-    now = datetime.now()
-    ends = now + timedelta(
-        seconds=AUCTION_DURATION
-    )
-
-    data["auction"] = {
-        "active": True,
-        "player_id": player_id,
-        "highest_bid": 0,
-        "highest_bidder": None,
-        "started_at": now.isoformat(),
-        "ends_at": ends.isoformat(),
-        "bid_history": [],
-    }
-
-    player["status"] = "auctioned"
-
-    save_data(data)
-
-    text = (
-        "🔥 <b>AUCTION STARTED!</b>\n\n"
-        f"⚽ <b>{player['name']}</b>\n"
-        f"🆔 Player ID: <code>{player_id}</code>\n\n"
-        f"💰 Starting Bid: <b>{format_cr(MIN_START_BID)}</b>\n"
-        f"📈 Minimum Increment: <b>{format_cr(MIN_INCREMENT)}</b>\n"
-        f"📈 Maximum Increment: <b>{format_cr(MAX_INCREMENT)}</b>\n"
-        f"⏱️ Time: <b>{AUCTION_DURATION} seconds</b>\n\n"
-        "👇 Place your bid:"
-    )
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=auction_keyboard(),
-    )
-
-    # Schedule automatic completion
-    context.application.create_task(
-        auction_timer(
-            context,
-            player_id,
-            ends,
-        )
-    )
 
 
 # ============================================================
-# AUCTION TIMER
+# STOP AUCTION
 # ============================================================
 
-
-async def auction_timer(
-    context,
-    player_id,
-    end_time,
-):
-    seconds = max(
-        0,
-        (
-            end_time - datetime.now()
-        ).total_seconds(),
-    )
-
-    await asyncio.sleep(seconds)
-
-    auction_data = data["auction"]
-
-    if not auction_data["active"]:
-        return
-
-    if auction_data["player_id"] != player_id:
-        return
-
-    await finish_auction(
-        context.bot,
-    )
-
-
-# ============================================================
-# FINISH AUCTION
-# ============================================================
-
-
-async def finish_auction(bot):
-    auction_data = data["auction"]
-
-    if not auction_data["active"]:
-        return
-
-    player_id = auction_data["player_id"]
-
-    player = get_player(player_id)
-
-    if not player:
-        data["auction"]["active"] = False
-        save_data(data)
-        return
-
-    highest_bidder_id = auction_data[
-        "highest_bidder"
-    ]
-
-    highest_bid = float(
-        auction_data["highest_bid"]
-    )
-
-    if (
-        highest_bidder_id is not None
-        and highest_bid >= MIN_START_BID
-    ):
-        user = get_user(highest_bidder_id)
-
-        if user:
-            user["spent"] = round(
-                user["spent"] + highest_bid,
-                2,
-            )
-
-            user["squad"].append(
-                player_id
-            )
-
-            player["status"] = "sold"
-            player["sold_to"] = highest_bidder_id
-            player["sold_price"] = highest_bid
-
-            result_text = (
-                "🔨 <b>SOLD!</b>\n\n"
-                f"⚽ <b>{player['name']}</b>\n"
-                f"👑 Winner: <b>{user['name']}</b>\n"
-                f"💰 Price: <b>{format_cr(highest_bid)}</b>\n"
-                f"💳 Remaining Balance: "
-                f"<b>{format_cr(remaining_balance(user['id']))}</b>"
-            )
-        else:
-            player["status"] = "unsold"
-
-            result_text = (
-                "❌ <b>UNSOLD</b>\n\n"
-                f"⚽ {player['name']}"
-            )
-
-    else:
-        player["status"] = "unsold"
-        player["sold_to"] = None
-        player["sold_price"] = 0
-
-        result_text = (
-            "❌ <b>UNSOLD</b>\n\n"
-            f"⚽ <b>{player['name']}</b>\n"
-            "No valid bids were placed."
-        )
-
-    # Close auction
-    data["auction"] = {
-        "active": False,
-        "player_id": None,
-        "highest_bid": 0,
-        "highest_bidder": None,
-        "started_at": None,
-        "ends_at": None,
-        "bid_history": [],
-    }
-
-    save_data(data)
-
-    # Send result to all registered users
-    chat_ids = list(data["participants"].keys())
-
-    for chat_id in chat_ids:
-        try:
-            await bot.send_message(
-                chat_id=int(chat_id),
-                text=result_text,
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.warning(
-                "Could not send result to %s: %s",
-                chat_id,
-                e,
-            )
-
-
-# ============================================================
-# ADMIN: STOP
-# ============================================================
-
-
-async def stop_auction(
+async def stopauction(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not is_admin(update.effective_user.id):
+
+    user = update.effective_user
+
+    if not is_admin(user.id):
+
         await update.message.reply_text(
             "❌ Admin only."
         )
+
         return
 
-    if not data["auction"]["active"]:
-        await update.message.reply_text(
-            "❌ No active auction."
+    async with auction_lock:
+
+        auction = db.get_active_auction()
+
+        if not auction:
+
+            await update.message.reply_text(
+                "ℹ️ No active auction."
+            )
+
+            return
+
+        auction_id = auction.get(
+            "id"
         )
-        return
 
-    await finish_auction(
-        context.bot
-    )
-
-    await update.message.reply_text(
-        "🛑 Auction stopped and processed."
-    )
-
-
-# ============================================================
-# ADMIN: CANCEL
-# ============================================================
-
-
-async def cancel_auction(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text(
-            "❌ Admin only."
+        task = auction_tasks.get(
+            auction_id
         )
-        return
 
-    auction_data = data["auction"]
+        if task:
 
-    if not auction_data["active"]:
-        await update.message.reply_text(
-            "❌ No active auction."
+            task.cancel()
+
+        db.cancel_auction(
+            auction_id
         )
-        return
 
-    player = get_player(
-        auction_data["player_id"]
-    )
-
-    if player:
-        player["status"] = "pending"
-
-    data["auction"] = {
-        "active": False,
-        "player_id": None,
-        "highest_bid": 0,
-        "highest_bidder": None,
-        "started_at": None,
-        "ends_at": None,
-        "bid_history": [],
-    }
-
-    save_data(data)
-
-    await update.message.reply_text(
-        "🛑 Auction cancelled.\n"
-        "No balance has been deducted."
-    )
-
-
-# ============================================================
-# ADMIN: SKIP
-# ============================================================
-
-
-async def skip_player(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
         await update.message.reply_text(
-            "❌ Admin only."
+            "🛑 Auction stopped."
         )
-        return
-
-    if not data["auction"]["active"]:
-        await update.message.reply_text(
-            "❌ No active auction."
-        )
-        return
-
-    player = get_player(
-        data["auction"]["player_id"]
-    )
-
-    if player:
-        player["status"] = "unsold"
-
-    data["auction"] = {
-        "active": False,
-        "player_id": None,
-        "highest_bid": 0,
-        "highest_bidder": None,
-        "started_at": None,
-        "ends_at": None,
-        "bid_history": [],
-    }
-
-    save_data(data)
-
-    await update.message.reply_text(
-        "⏭️ Player skipped and marked UNSOLD."
-    )
 
 
 # ============================================================
-# PARTICIPANTS ADMIN
+# PARTICIPANTS
 # ============================================================
-
 
 async def participants(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not is_admin(update.effective_user.id):
+
+    user = update.effective_user
+
+    if not is_admin(user.id):
+
         await update.message.reply_text(
             "❌ Admin only."
         )
+
         return
 
-    users = data["participants"].values()
+    people = db.get_all_participants()
 
-    if not users:
+    if not people:
+
         await update.message.reply_text(
-            "No participants."
+            "No participants registered."
         )
+
         return
 
-    text = (
-        f"👥 <b>Participants</b>\n"
-        f"Total: <b>{len(data['participants'])}</b>\n\n"
-    )
+    lines = [
+        f"👥 **PARTICIPANTS: {len(people)}**\n"
+    ]
 
-    for index, user in enumerate(users, 1):
-        text += (
-            f"{index}. <b>{user['name']}</b>\n"
-            f"💰 {format_cr(remaining_balance(user['id']))}\n"
-            f"⚽ {len(user['squad'])} players\n\n"
-        )
-
-        if index >= 100:
-            break
-
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-
-async def history(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    history_data = data["auction"]["bid_history"]
-
-    if not history_data:
-        await update.message.reply_text(
-            "📜 No bids yet."
-        )
-        return
-
-    text = "📜 <b>Bid History</b>\n\n"
-
-    for index, bid in enumerate(
-        reversed(history_data),
-        1,
+    for index, person in enumerate(
+        people,
+        1
     ):
-        text += (
-            f"{index}. <b>{bid['name']}</b> — "
-            f"{format_cr(bid['amount'])}\n"
+
+        name = (
+            person.get("username")
+            or person.get("full_name")
+            or str(person.get("user_id"))
         )
 
-        if index >= 50:
-            break
+        balance_value = person.get(
+            "balance",
+            0
+        )
+
+        lines.append(
+            f"{index}. {name} — "
+            f"{format_cr(balance_value)}"
+        )
 
     await update.message.reply_text(
-        text,
-        parse_mode="HTML",
+        "\n".join(lines[:101])
     )
 
 
 # ============================================================
-# ADMIN ANNOUNCEMENT
+# STATS
 # ============================================================
 
-
-async def announce(
+async def stats(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not is_admin(update.effective_user.id):
+
+    user = update.effective_user
+
+    if not is_admin(user.id):
+
         await update.message.reply_text(
             "❌ Admin only."
         )
+
         return
 
-    if not context.args:
+    try:
+
+        data = db.get_statistics()
+
         await update.message.reply_text(
-            "Usage:\n/announce Your message"
+            "📊 **AUCTION STATISTICS**\n\n"
+            f"👥 Participants: "
+            f"{data.get('participants', 0)}\n"
+            f"⚽ Players: "
+            f"{data.get('players', 0)}\n"
+            f"🔨 Auctions: "
+            f"{data.get('auctions', 0)}\n"
+            f"💰 Total Bids: "
+            f"{data.get('bids', 0)}\n"
+            f"🟢 Sold: "
+            f"{data.get('sold', 0)}\n"
+            f"🔴 Unsold: "
+            f"{data.get('unsold', 0)}"
         )
-        return
 
-    message = " ".join(context.args)
+    except Exception as e:
 
-    text = (
-        "📢 <b>AUCTION ANNOUNCEMENT</b>\n\n"
-        f"{message}"
-    )
-
-    for chat_id in data["participants"].keys():
-        try:
-            await context.bot.send_message(
-                chat_id=int(chat_id),
-                text=text,
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    await update.message.reply_text(
-        "✅ Announcement sent."
-    )
+        await update.message.reply_text(
+            f"❌ Could not load statistics.\n\n{e}"
+        )
 
 
 # ============================================================
-# ADMIN RESET
+# RESET DATABASE
 # ============================================================
-
 
 async def reset(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
-    if not is_admin(update.effective_user.id):
+
+    user = update.effective_user
+
+    if not is_admin(user.id):
+
         await update.message.reply_text(
             "❌ Admin only."
         )
+
         return
 
-    # Confirmation requirement
-    if not context.args or context.args[0].lower() != "confirm":
+    if not context.args:
+
         await update.message.reply_text(
-            "⚠️ This will reset the entire auction database.\n\n"
-            "To confirm:\n"
-            "/reset confirm"
+            "⚠️ This will reset the auction database.\n\n"
+            "Use:\n"
+            "/reset CONFIRM"
         )
+
         return
 
-    global data
+    if context.args[0].upper() != "CONFIRM":
 
-    data = json.loads(
-        json.dumps(DEFAULT_DATA)
+        await update.message.reply_text(
+            "❌ Reset cancelled."
+        )
+
+        return
+
+    async with auction_lock:
+
+        for task in list(
+            auction_tasks.values()
+        ):
+
+            task.cancel()
+
+        auction_tasks.clear()
+
+        db.reset_database()
+
+        await update.message.reply_text(
+            "♻️ Database reset successfully."
+        )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        "🤖 **eFootball Auction Bot**\n\n"
+
+        "👤 **Participant Commands**\n"
+        "/register - Register for auction\n"
+        "/balance - Check balance\n"
+        "/squad - View squad\n"
+        "/leaderboard - Leaderboard\n"
+        "/auction - Current auction\n"
+        "/players - Player list\n"
+        "/history ID - Bid history\n\n"
+
+        "👑 **Admin Commands**\n"
+        "/addplayer NAME POSITION RATING\n"
+        "/startauction PLAYER_ID\n"
+        "/skipauction\n"
+        "/stopauction\n"
+        "/participants\n"
+        "/stats\n"
+        "/reset CONFIRM\n\n"
+
+        "⚙️ **Auction Rules**\n"
+        "• Maximum Players: 500\n"
+        "• Maximum Participants: 500\n"
+        "• Starting Budget: 100 Cr\n"
+        "• Starting Bid: 2 Cr\n"
+        "• Minimum Increment: 0.5 Cr\n"
+        "• Maximum Increment: 2 Cr\n"
+        "• Auction Duration: 30 seconds\n"
+        "• Timer never resets after bidding"
     )
 
-    save_data(data)
-
     await update.message.reply_text(
-        "♻️ <b>Complete auction reset.</b>\n\n"
-        "Participants, players, squads and auction history "
-        "have been reset.",
-        parse_mode="HTML",
+        text,
+        parse_mode="Markdown"
     )
 
 
@@ -1327,30 +1538,27 @@ async def reset(
 # ERROR HANDLER
 # ============================================================
 
-
 async def error_handler(
     update: object,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
+
     logger.exception(
-        "Exception while handling update:",
-        exc_info=context.error,
+        "Telegram bot error",
+        exc_info=context.error
     )
 
 
 # ============================================================
-# MAIN
+# TELEGRAM BOT
 # ============================================================
 
+def create_bot():
 
-def main():
-    if (
-        not BOT_TOKEN
-        or BOT_TOKEN == "PUT_YOUR_BOT_TOKEN_HERE"
-    ):
-        raise ValueError(
-            "Please add your Telegram Bot Token "
-            "to BOT_TOKEN."
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+
+        raise RuntimeError(
+            "BOT_TOKEN is not configured."
         )
 
     application = (
@@ -1359,84 +1567,134 @@ def main():
         .build()
     )
 
-    # General
+    # -----------------------------------------
+    # PARTICIPANT COMMANDS
+    # -----------------------------------------
+
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            help_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("register", register)
+        CommandHandler(
+            "register",
+            register
+        )
     )
 
     application.add_handler(
-        CommandHandler("balance", balance)
+        CommandHandler(
+            "balance",
+            balance
+        )
     )
 
     application.add_handler(
-        CommandHandler("squad", squad)
+        CommandHandler(
+            "squad",
+            squad
+        )
     )
 
     application.add_handler(
-        CommandHandler("players", players)
+        CommandHandler(
+            "leaderboard",
+            leaderboard
+        )
     )
 
     application.add_handler(
-        CommandHandler("leaderboard", leaderboard)
+        CommandHandler(
+            "players",
+            players
+        )
     )
 
     application.add_handler(
-        CommandHandler("auction", auction)
+        CommandHandler(
+            "history",
+            history
+        )
     )
 
     application.add_handler(
-        CommandHandler("history", history)
+        CommandHandler(
+            "auction",
+            current_auction
+        )
     )
 
-    # Admin
-    application.add_handler(
-        CommandHandler("addplayer", add_player)
-    )
+    # -----------------------------------------
+    # ADMIN COMMANDS
+    # -----------------------------------------
 
     application.add_handler(
-        CommandHandler("removeplayer", remove_player)
-    )
-
-    application.add_handler(
-        CommandHandler("startauction", start_auction)
-    )
-
-    application.add_handler(
-        CommandHandler("stop", stop_auction)
+        CommandHandler(
+            "addplayer",
+            addplayer
+        )
     )
 
     application.add_handler(
-        CommandHandler("cancel", cancel_auction)
+        CommandHandler(
+            "startauction",
+            startauction
+        )
     )
 
     application.add_handler(
-        CommandHandler("skip", skip_player)
+        CommandHandler(
+            "skipauction",
+            skipauction
+        )
     )
 
     application.add_handler(
-        CommandHandler("participants", participants)
+        CommandHandler(
+            "stopauction",
+            stopauction
+        )
     )
 
     application.add_handler(
-        CommandHandler("announce", announce)
+        CommandHandler(
+            "participants",
+            participants
+        )
     )
 
     application.add_handler(
-        CommandHandler("reset", reset)
+        CommandHandler(
+            "stats",
+            stats
+        )
     )
 
-    # Buttons
+    application.add_handler(
+        CommandHandler(
+            "reset",
+            reset
+        )
+    )
+
+    # -----------------------------------------
+    # BID BUTTONS
+    # -----------------------------------------
+
     application.add_handler(
         CallbackQueryHandler(
-            callback_handler
+            bid_callback,
+            pattern=r"^bid:"
         )
     )
 
@@ -1444,12 +1702,38 @@ def main():
         error_handler
     )
 
-    print(
-        "🔥 eFootball Auction Bot started..."
+    return application
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    logger.info(
+        "Starting eFootball Auction Bot..."
     )
 
+    # Start HTTP server in background thread
+    http_thread = threading.Thread(
+        target=run_http_server,
+        daemon=True
+    )
+
+    http_thread.start()
+
+    # Create Telegram bot
+    application = create_bot()
+
+    logger.info(
+        "Telegram bot started."
+    )
+
+    # Start polling
     application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
     )
 
 
