@@ -1482,55 +1482,6 @@ async def announce_current(
     )
 ],
 [
-    InlineKeyboardButton(
-        "📊 Current Bid",
-        callback_data=f"bids:{auction['code']}"
-    )
-], 
-    InlineKeyboardButton(
-        "💰 Bid +1.0 Cr",
-        callback_data=f"bid:1.0:{auction['code']}"
-    )
-],
-[
-    InlineKeyboardButton(
-        "💰 Bid +1.5 Cr",
-        callback_data=f"bid:1.5:{auction['code']}"
-    ),
-    InlineKeyboardButton(
-        "💰 Bid +2.0 Cr",
-        callback_data=f"bid:2.0:{auction['code']}"
-    )
-],
-[
-    InlineKeyboardButton(
-        "📊 Current Bid",
-        callback_data=f"bids:{auction['code']}"
-    )
-],,
-    InlineKeyboardButton(
-        "💰 Bid +1.0 Cr",
-        callback_data=f"bid:1.0:{auction['code']}"
-    )
-],
-[
-    InlineKeyboardButton(
-        "💰 Bid +1.5 Cr",
-        callback_data=f"bid:1.5:{auction['code']}"
-    ),
-    InlineKeyboardButton(
-        "💰 Bid +2.0 Cr",
-        callback_data=f"bid:2.0:{auction['code']}"
-    )
-],
-[
-    InlineKeyboardButton(
-        "📊 Current Bid",
-        callback_data=f"bids:{auction['code']}"
-    )
-],
-        ],
-        [
             InlineKeyboardButton(
                 "📊 Current Bid",
                 callback_data=f"bids:{auction['code']}"
