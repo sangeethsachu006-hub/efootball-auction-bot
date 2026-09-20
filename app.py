@@ -1462,6 +1462,7 @@ async def announce_current(
 
     buttons = [
        [
+    [
     InlineKeyboardButton(
         "💰 Bid +0.5 Cr",
         callback_data=f"bid:0.5:{auction['code']}"
@@ -1482,10 +1483,11 @@ async def announce_current(
     )
 ],
 [
-            InlineKeyboardButton(
-                "📊 Current Bid",
-                callback_data=f"bids:{auction['code']}"
-            ),
+    InlineKeyboardButton(
+        "📊 Current Bid",
+        callback_data=f"bids:{auction['code']}"
+    )
+],
             InlineKeyboardButton(
                 "👤 My Balance",
                 callback_data=f"bal:{auction['code']}"
