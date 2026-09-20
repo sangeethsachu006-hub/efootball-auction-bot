@@ -1870,92 +1870,105 @@ async def button(
 
     if data.startswith("bid:"):
 
-        code_value = data.split(
-            ":",
-            1
-        )[1]
+    parts = data.split(":")
 
-        auction = db.get_auction(
-            code_value
+    if len(parts) != 3:
+        await query.message.reply_text(
+            "❌ Invalid bid."
         )
-
-        if not auction:
-
-            await query.message.reply_text(
-                "❌ Auction not found."
-            )
-
-            return
-
-        participant = db.participant(
-            auction["id"],
-            query.from_user.id
-        )
-
-        if not participant:
-
-            await query.message.reply_text(
-                "❌ You are not a participant."
-            )
-
-            return
-
-        if auction["state"] != "RUNNING":
-
-            await query.message.reply_text(
-                "❌ Bidding is not currently active."
-            )
-
-            return
-
-        player = db.current_player(
-            auction["id"]
-        )
-
-        if not player:
-
-            await query.message.reply_text(
-                "❌ No active player."
-            )
-
-            return
-
-        try:
-
-            result = db.bid(
-                auction["id"],
-                query.from_user.id
-            )
-
-        except Exception as error:
-
-            log.exception(
-                "Bid error: %s",
-                error
-            )
-
-            await query.message.reply_text(
-                "❌ Bid failed. Please try again."
-            )
-
-            return
-
-        if isinstance(result, tuple):
-
-            ok, message = result
-
-            await query.message.reply_text(
-                ("✅ " if ok else "❌ ")
-                + str(message)
-            )
-
-        else:
-
-            await query.message.reply_text(
-                "❌ Bid could not be processed."
-            )
-
         return
+
+    try:
+        increment = float(parts[1])
+        code_value = parts[2]
+
+    except ValueError:
+        await query.message.reply_text(
+            "❌ Invalid bid amount."
+        )
+        return
+
+    # Validate bid increment
+    if increment < 0.5 or increment > 2.0:
+        await query.message.reply_text(
+            "❌ Bid increment must be between 0.5 Cr and 2.0 Cr."
+        )
+        return
+
+    auction = db.get_auction(
+        code_value
+    )
+
+    if not auction:
+        await query.message.reply_text(
+            "❌ Auction not found."
+        )
+        return
+
+    participant = db.participant(
+        auction["id"],
+        query.from_user.id
+    )
+
+    if not participant:
+        await query.message.reply_text(
+            "❌ You are not a participant."
+        )
+        return
+
+    if auction["state"] != "RUNNING":
+        await query.message.reply_text(
+            "❌ Bidding is not currently active."
+        )
+        return
+
+    player = db.current_player(
+        auction["id"]
+    )
+
+    if not player:
+        await query.message.reply_text(
+            "❌ No active player."
+        )
+        return
+
+    try:
+
+        result = db.bid(
+            auction["id"],
+            query.from_user.id,
+            increment
+        )
+
+    except Exception as error:
+
+        log.exception(
+            "Bid error: %s",
+            error
+        )
+
+        await query.message.reply_text(
+            "❌ Bid failed. Please try again."
+        )
+        return
+
+    if isinstance(result, tuple):
+
+        ok = result[0]
+        message = result[1]
+
+        await query.message.reply_text(
+            ("✅ " if ok else "❌ ")
+            + str(message)
+        )
+
+    else:
+
+        await query.message.reply_text(
+            "❌ Bid could not be processed."
+        )
+
+    return
 
     # -----------------------------------------------------
     # CURRENT BIDS
